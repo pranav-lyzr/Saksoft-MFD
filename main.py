@@ -511,13 +511,13 @@ async def code_search(query: AgentQuery):
         )
         if not project or "search_agent_id" not in project:
             raise HTTPException(status_code=404, detail="Agent not configured")
-
+        print("SEARCH AGENT ID",project["search_agent_id"])
         payload = {
             "user_id": USER_ID,
-            # "agent_id": project["search_agent_id"],
-            # "session_id": project["search_agent_id"],
-            "agent_id": "67c556420606a0f240481e79",
-            "session_id": "67c556420606a0f240481e79",
+            "agent_id": project["search_agent_id"],
+            "session_id": project["search_agent_id"],
+            # "agent_id": "67c556420606a0f240481e79",
+            # "session_id": "67c556420606a0f240481e79",
             "message": query.message
         }
         
@@ -541,13 +541,14 @@ async def code_generate(query: AgentQuery):
         )
         if not project or "generate_agent_id" not in project:
             raise HTTPException(status_code=404, detail="Agent not configured")
+        print("GENERATE AGENT ID",project["generate_agent_id"])
 
         payload = {
             "user_id": USER_ID,
-            # "agent_id": project["generate_agent_id"],
-            # "session_id": project["generate_agent_id"],
-            "agent_id": "67c55dfe8cfac3392e3a4eb0",
-            "session_id": "67c55dfe8cfac3392e3a4eb0",
+            "agent_id": project["generate_agent_id"],
+            "session_id": project["generate_agent_id"],
+            # "agent_id": "67c55dfe8cfac3392e3a4eb0",
+            # "session_id": "67c55dfe8cfac3392e3a4eb0",
             "message": query.message
         }
         
@@ -577,6 +578,7 @@ async def get_project(project_id: str):
     project = await db.projects.find_one({"_id": ObjectId(project_id)})
     if not project:
         raise HTTPException(status_code=404, detail="Project not found")
+    project["_id"] = str(project["_id"])
     return project
 
 # 7️⃣ Delete Project (DELETE)
