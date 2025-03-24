@@ -618,3 +618,8 @@ async def delete_project(project_id: str):
 #     if response.status_code != 200:
 #         raise HTTPException(status_code=response.status_code, detail=response.text)
 #     return response.json()
+
+
+@app.get("/health")
+def health_check():
+    return {"status": "healthy"}
