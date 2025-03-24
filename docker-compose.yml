@@ -1,0 +1,31 @@
+version: "3.8"
+
+services:
+  fastapi_app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app  # Mounts current directory to /app in the container
+    depends_on:
+      - mongo
+    environment:
+      - MONGO_URI=mongodb://mongo:27017/mydatabase  # MongoDB connection string
+    stdin_open: true  # Keep the container's standard input open
+    tty: true  # Allocate a pseudo-TTY
+
+  mongo:
+    image: mongo:latest  # Use the latest stable MongoDB version
+    container_name: mongodb
+    restart: always
+    ports:
+      - "27018:27017"
+    volumes:
+      - mongo_data:/data/db  # Persistent volume for MongoDB storage
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: example  # Change this in production
+
+volumes:
+  mongo_data:
+    driver: local
