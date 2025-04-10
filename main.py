@@ -370,13 +370,20 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
         "user_id": str(user["_id"])
     }
 
-# User Management APIs (No Secret Key)
 @app.post("/users", response_model=User, tags=["User Management"])
 async def create_user(user: UserCreate, current_user: User = Depends(get_current_admin_user)):
-    existing_user = await db.users.find_one({"username": user.username, "client_id": current_user.client_id})
+    # Check if the username already exists within the same client
+    existing_user = await db.users.find_one({
+        "username": user.username,
+        "client_id": current_user.client_id
+    })
     if existing_user:
-        raise HTTPException(status_code=400, detail="Username already registered under this client")
+        raise HTTPException(
+            status_code=400,
+            detail="Username already registered under this client. Please choose a different username."
+        )
     
+    # Proceed with user creation if username is unique
     hashed_password = pwd_context.hash(user.password)
     new_user = {
         "username": user.username,
@@ -396,6 +403,7 @@ async def create_user(user: UserCreate, current_user: User = Depends(get_current
         projects=[str(pid) for pid in created_user.get("projects", [])],
         client_id=created_user["client_id"]
     )
+
 
 @app.get("/users", response_model=List[User], tags=["User Management"])
 async def read_users(current_user: User = Depends(get_current_user)):
@@ -450,16 +458,37 @@ async def read_user(user_id: str, current_user: User = Depends(get_current_user)
             raise HTTPException(status_code=403, detail="Not authorized to view this user")
     
     sessions = await db.chat_sessions.find({"user_id": user_id}).to_list(None)
-    chat_sessions = [ChatSession(**{**session, "id": str(session["_id"])}) for session in sessions]
+    # Convert project_id to string when creating ChatSession instances
+    chat_sessions = [
+        ChatSession(
+            id=str(session["_id"]),
+            agent_session_id=session["agent_session_id"],
+            user_id=session["user_id"],
+            project_id=str(session["project_id"]),  # Convert ObjectId to string
+            type=session["type"],
+            created_at=session["created_at"],
+            updated_at=session["updated_at"]
+        ) for session in sessions
+    ]
     session_ids = [ObjectId(session.id) for session in chat_sessions]
     messages = await db.chat_messages.find({"session_id": {"$in": session_ids}}).to_list(None)
-    chat_messages = [Message(**{**message, "id": str(message["_id"]), "session_id": str(message["session_id"])}) for message in messages]
+    chat_messages = [
+        Message(
+            id=str(message["_id"]),
+            session_id=str(message["session_id"]),
+            role=message["role"],
+            content=message["content"],
+            timestamp=message["timestamp"],
+            type=message["type"]
+        ) for message in messages
+    ]
     
     return UserWithSessionsAndChats(
         **user_model.dict(),
         chat_sessions=chat_sessions,
         chat_messages=chat_messages
     )
+
 
 @app.put("/users/{user_id}", response_model=User, tags=["User Management"])
 async def update_user(user_id: str, user_update: UserUpdate, current_user: User = Depends(get_current_admin_user)):
@@ -986,18 +1015,25 @@ def chunk_text(text: str, max_tokens: int = 7000) -> List[str]:
         chunks.append(encoder.decode(chunk_tokens))
     return chunks
 
+# ... (Previous imports and setup remain unchanged)
+
 async def analyze_repository_background(project_id: ObjectId, repo_url: str, source_name: str, pat: Optional[str] = None):
     temp_dir = tempfile.mkdtemp()
+    print(f"Created temporary directory: {temp_dir}")
     try:
+        # Clone the repository
         if pat:
             parsed_url = repo_url.replace("https://", f"https://{pat}@")
         else:
             parsed_url = repo_url
         Repo.clone_from(parsed_url, temp_dir)
-        
+                
+        # Analyze the repository
         analysis_result = await analyzer.analyze_repository(temp_dir)
         result_dict = json.loads(json.dumps(analysis_result, default=str))
+        print(f"Analysis completed. Keys in result_dict: {list(result_dict.keys())}")
 
+        # Combine all analysis data into one text block
         combined_text = ""
         if result_dict.get("db_schemas"):
             combined_text += f"DB Schemas:\n{json.dumps(result_dict['db_schemas'])}\n\n"
@@ -1013,8 +1049,10 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             combined_text += f"RAG Data:\n{rag_text}\n\n"
 
         if not combined_text.strip():
+            print(f"No text content to chunk for repository {source_name}")
             combined_text = "No analyzable content found in repository."
 
+        print(f"Processing repository {source_name} with {len(combined_text)} characters")
         text_chunks = chunk_text(combined_text)
         chunked_documents = [
             {
@@ -1027,7 +1065,10 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             }
             for chunk in text_chunks
         ]
+        print(f"Added {len(text_chunks)} chunks from {source_name}")
+        print(f"Total chunked documents prepared: {len(chunked_documents)}")
 
+        # Store analysis results in the database
         analysis_entry = {
             "repo_url": repo_url,
             "source_name": source_name,
@@ -1042,34 +1083,147 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             {"_id": project_id},
             {"$push": {"repo_analyses": analysis_entry}}
         )
+        print("Database updated with analysis result and chunk metadata")
 
+        # Fetch project to check RAG status
         project = await db.projects.find_one({"_id": project_id})
         if not project:
             raise Exception("Project not found")
         project_name = project["name"]
 
+        if not chunked_documents:
+            print("No chunked documents available for RAG training")
+            return  # Exit early if there's nothing to train
+
+        print(f"Preparing to train RAG with {len(chunked_documents)} documents")
+
+        # Handle RAG and agent creation logic
         if "rag_id" not in project:
+            # Step 1: Create RAG collection if it doesn't exist
             rag_id = create_rag_collection()
             if not rag_id:
                 raise Exception("Failed to create RAG collection")
-            train_rag(rag_id, chunked_documents)
+            print(rag_id)
+            # Step 2: Train the new RAG with documents
+            if not train_rag(rag_id, chunked_documents):
+                raise Exception("Failed to train RAG collection")
+
+            # Step 3: Create agents only for a new RAG
             search_agent = create_agent(rag_id, "search", SEARCH_INSTRUCTIONS, project_name)
             generate_agent = create_agent(rag_id, "generate", GENERATE_INSTRUCTIONS, project_name)
+
+            # Step 4: Validate agent creation
+            if not search_agent or not isinstance(search_agent, dict) or "agent_id" not in search_agent:
+                raise Exception("Failed to create search agent")
+            if not generate_agent or not isinstance(generate_agent, dict) or "agent_id" not in generate_agent:
+                raise Exception("Failed to create generate agent")
+
+            # Step 5: Update project with RAG and agent IDs
             update_data = {
                 "rag_id": rag_id,
-                "search_agent_id": search_agent.get("agent_id"),
-                "generate_agent_id": generate_agent.get("agent_id")
+                "search_agent_id": search_agent["agent_id"],
+                "generate_agent_id": generate_agent["agent_id"]
             }
             await db.projects.update_one({"_id": project_id}, {"$set": update_data})
+            print(f"New RAG created (ID: {rag_id}) and agents initialized")
         else:
+            # If RAG exists, just train it with new documents
             rag_id = project["rag_id"]
-            train_rag(rag_id, chunked_documents)
+            if not train_rag(rag_id, chunked_documents):
+                raise Exception("Failed to train existing RAG collection")
+            print(f"Trained existing RAG (ID: {rag_id}) with new documents")
 
     except Exception as e:
-        raise
+        print(f"Error in analyze_repository_background: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Repository analysis failed: {str(e)}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
+        print("Cleanup completed")
 
+# # Utility Functions (Updated for better error handling)
+# def create_rag_collection():
+#     try:
+#         response = requests.post(
+#             f"{LYZR_RAG_API_URL}/",
+#             headers={"x-api-key": API_KEY},
+#             json={
+#                 "user_id": USER_ID,
+#                 "llm_credential_id": "lyzr_openai",
+#                 "embedding_credential_id": "lyzr_openai",
+#                 "vector_db_credential_id": "lyzr_weaviate",
+#                 "vector_store_provider": "Weaviate [Lyzr]",
+#                 "description": "Repository analysis RAG",
+#                 "collection_name": f"repo_rag_{int(time.time())}",
+#                 "llm_model": "gpt-4o-mini",
+#                 "embedding_model": "text-embedding-ada-002"
+#             }
+#         )
+#         if response.status_code != 200:
+#             print(f"RAG creation failed with status {response.status_code}: {response.text}")
+#             return None
+#         data = response.json()
+#         rag_id = data.get('id')
+#         if not rag_id:
+#             print(f"RAG creation response missing 'id': {data}")
+#             return None
+#         return rag_id
+#     except Exception as e:
+#         print(f"RAG creation failed: {str(e)}")
+#         return None
+
+# def train_rag(rag_id, documents):
+#     try:
+#         response = requests.post(
+#             f"{LYZR_RAG_API_URL}/train/{rag_id}/",
+#             headers={"x-api-key": API_KEY},
+#             json=documents
+#         )
+#         if response.status_code != 200:
+#             print(f"RAG training failed with status {response.status_code}: {response.text}")
+#             return False
+#         return True
+#     except Exception as e:
+#         print(f"RAG training failed: {str(e)}")
+#         return False
+
+# def create_agent(rag_id, agent_type, instructions, project_name):
+#     try:
+#         url = "https://agent-prod.studio.lyzr.ai/v3/agents/template/single-task"
+#         headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+#         payload = {
+#             "name": f"repo_{project_name}_{agent_type}_agent",
+#             "description": f"repo_{project_name}_{agent_type}_agent",
+#             "agent_instructions": instructions,
+#             "agent_role": f"Agent for code {agent_type}",
+#             "llm_credential_id": "lyzr_openai",
+#             "provider_id": "OpenAI",
+#             "model": "gpt-4o-mini",
+#             "temperature": 0.7,
+#             "top_p": 0.9,
+#             "features": [
+#                 {
+#                     "type": "KNOWLEDGE_BASE",
+#                     "config": {"lyzr_rag": {"base_url": "https://rag-prod.studio.lyzr.ai", "rag_id": rag_id, "rag_name": "SakSoft Code Rag"}}
+#                 },
+#                 {"type": "SHORT_TERM_MEMORY", "config": {}},
+#                 {"type": "LONG_TERM_MEMORY", "config": {}}
+#             ],
+#             "tools": []
+#         }
+#         response = requests.post(url, headers=headers, json=payload)
+#         if response.status_code != 200:
+#             print(f"Agent creation failed for {agent_type} with status {response.status_code}: {response.text}")
+#             return None
+#         data = response.json()
+#         if "agent_id" not in data:
+#             print(f"Agent creation response missing 'agent_id' for {agent_type}: {data}")
+#             return None
+#         return data
+#     except Exception as e:
+#         print(f"Agent creation failed for {agent_type}: {str(e)}")
+#         return None
+
+# ... (Rest of the code remains unchanged)
 SEARCH_INSTRUCTIONS = """# Code Repository RAG Assistant Instructions
 ## SEARCH INSTRUCTIONS
 Your TASK is to ASSIST users in finding SPECIFIC code elements within their codebase, using ONLY the information available in the provided code repository RAG. You MUST follow these STEPS:
@@ -1163,6 +1317,7 @@ def train_rag(rag_id, documents):
             headers={"x-api-key": API_KEY},
             json=documents
         )
+        print("Training response",response)
         return True
     except Exception as e:
         print(f"RAG training failed: {str(e)}")
@@ -1185,17 +1340,40 @@ def create_agent(rag_id, agent_type, instructions, project_name):
             "features": [
                 {
                     "type": "KNOWLEDGE_BASE",
-                    "config": {"lyzr_rag": {"base_url": "https://rag-prod.studio.lyzr.ai", "rag_id": rag_id, "rag_name": "SakSoft Code Rag"}}
+                    "config": {
+                        "lyzr_rag": {
+                            "base_url": "https://rag-prod.studio.lyzr.ai",
+                            "rag_id": rag_id,
+                            "rag_name": "SakSoft Code Rag"
+                        }
+                    },
+                    "priority": 0  # Highest priority for knowledge base
                 },
-                {"type": "SHORT_TERM_MEMORY", "config": {}},
-                {"type": "LONG_TERM_MEMORY", "config": {}}
+                {
+                    "type": "SHORT_TERM_MEMORY",
+                    "config": {},
+                    "priority": 1  # Medium priority
+                },
+                {
+                    "type": "LONG_TERM_MEMORY",
+                    "config": {},
+                    "priority": 2  # Lowest priority
+                }
             ],
             "tools": []
         }
         response = requests.post(url, headers=headers, json=payload)
-        return response.json() if response.status_code == 200 else None
+        if response.status_code != 200:
+            print(f"Agent creation failed for {agent_type} with status {response.status_code}: {response.text}")
+            return None
+        data = response.json()
+        if "agent_id" not in data:
+            print(f"Agent creation response missing 'agent_id' for {agent_type}: {data}")
+            return None
+        print(f"Agent created successfully for {agent_type}: {data}")
+        return data
     except Exception as e:
-        print(f"Agent creation failed: {str(e)}")
+        print(f"Agent creation failed for {agent_type}: {str(e)}")
         return None
 
 # Health Check (No Secret Key)
