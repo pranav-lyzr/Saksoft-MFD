@@ -365,36 +365,104 @@ class RepositoryAnalyzer:
     async def _analyze_rag_file(self, client: httpx.AsyncClient, file_path: str, repo_dir: str) -> Dict | None:
         """Analyze a single file for RAG metadata asynchronously"""
         try:
-            async with aiofiles.open(file_path, 'r', encoding='utf-8') as f:
-                content = await f.read()
-
-            if len(content) > 100000 or '\x00' in content:
+            if await self._is_binary_file(file_path):
+                print(f"Skipping binary file: {file_path}")
                 return None
 
-            rag_response = await self._call_lyzr_api_async(
-                client,
-                agent_id="67c48f268cfac3392e3a48e2",
-                session_id="67c48f268cfac3392e3a48e2",
-                system_prompt="",
-                message=json.dumps({
+            async with aiofiles.open(file_path, 'r', encoding='utf-8', errors='replace') as f:
+                content = await f.read()
+
+            if len(content) > 50000:  # More conservative size limit
+                return {
                     "file_path": os.path.relpath(file_path, repo_dir),
-                    "content": content[:15000]  # Truncate to 15k characters
-                })
-            )
-            parsed_response = json.loads(rag_response.replace('```json', '').replace('```', ''))
+                    "file_name": os.path.basename(file_path),
+                    "file_type": os.path.splitext(file_path)[1][1:].lower(),
+                    "rag_metadata": {"error": "File too large for analysis"},
+                    "analysis_date": datetime.now().isoformat()
+                }
+
+            # Enhanced system prompt with strict format requirements
+            system_prompt = """You are a code analysis assistant. Return JSON with:
+            - Code Structure: {Overall Organization, Modules, Classes, Functions}
+            - Dependencies: {Imports, Libraries, Frameworks}
+            - Database Interactions: {Schemas, Queries, ORM Usage}
+            - API Components: {Endpoints, Request/Response, Authentication}
+            - UI Components: {Elements, State Management, Rendering}
+            - Variable Naming: {Conventions, Consistency}
+            - Design Patterns: {Recognized Patterns}
+            - Performance: {Bottlenecks, Optimization}
+            - Security: {Practices, Vulnerabilities}
+            - Testing: {Methods, Coverage}
+            Rules:
+            1. Never generate code
+            2. Use only alphanumeric characters
+            3. No markdown formatting
+            4. Keep responses under 2000 tokens
+            5. Avoid special characters
+            6. Truncate long lines after 200 characters"""
+
+            # Strictly formatted user prompt
+            user_prompt = f"""
+            FILE_PATH: {os.path.relpath(file_path, repo_dir)}
+            FILE_TYPE: {os.path.splitext(file_path)[1][1:].lower()}
+            CONTENT: {content.strip()[:2000]}  # Truncate content
+            """
+
+            
+            
+            # API call with timeout and retry
+            try:
+                rag_response = await self._call_lyzr_api_async(
+                    client,
+                    agent_id="67c48f268cfac3392e3a48e2",
+                    session_id="67c48f268cfac3392e3a48e2",
+                    system_prompt=system_prompt,
+                    message=user_prompt
+                )
+            except httpx.HTTPStatusError as e:
+                print(f"HTTP error {e.response.status_code} for {file_path}")
+                return None
+            rag_response=json.loads(rag_response.replace('```json', '').replace('```', ''))
+            
+
+            print("rag_response",rag_response)
+            
+
+            # try:
+            #     parsed_response = json.loads(rag_response)
+            # except json.JSONDecodeError:
+            #     print(f"Failed to parse JSON for {file_path}")
+            #     return None
 
             return {
                 "file_path": os.path.relpath(file_path, repo_dir),
                 "file_name": os.path.basename(file_path),
                 "file_type": os.path.splitext(file_path)[1][1:].lower(),
-                "rag_metadata": parsed_response,
+                "rag_metadata": rag_response,
                 "analysis_date": datetime.now().isoformat()
             }
 
+        except UnicodeDecodeError:
+            print(f"Encoding error in {file_path} - skipping")
+            return None
         except Exception as e:
-            print(f"Error processing RAG metadata for {file_path}: {e}")
+            print(f"Error processing {file_path}: {str(e)}")
             return None
 
+    async def _is_binary_file(self, file_path: str) -> bool:
+        """Check if a file is binary using Linux file command"""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                'file', '--mime-type', '-b', file_path,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, stderr = await proc.communicate()
+            mime_type = stdout.decode().strip()
+            return not mime_type.startswith('text/') and 'json' not in mime_type
+        except Exception:
+            return True  # Fallback to binary if check fails
+        
     async def analyze_repository(self, repo_dir: str) -> Dict:
         """Main asynchronous analysis entry point"""
         print("Analyzing repository...")
