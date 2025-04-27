@@ -540,22 +540,32 @@ async def reset_password(user_id: str, reset_data: ResetPassword, current_user: 
 
 @app.post("/users/{user_id}/activate", tags=["User Management"])
 async def activate_user(user_id: str, current_user: User = Depends(get_current_admin_user)):
+    user = await db.users.find_one({"_id": ObjectId(user_id), "client_id": current_user.client_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found or not in your client")
+    if user["is_active"]:
+        raise HTTPException(status_code=400, detail="User is already active")
     result = await db.users.update_one(
         {"_id": ObjectId(user_id), "client_id": current_user.client_id},
         {"$set": {"is_active": True}}
     )
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="User not found or not in your client")
+        raise HTTPException(status_code=500, detail="Failed to activate user")
     return {"message": "User activated successfully"}
 
 @app.post("/users/{user_id}/deactivate", tags=["User Management"])
 async def deactivate_user(user_id: str, current_user: User = Depends(get_current_admin_user)):
+    user = await db.users.find_one({"_id": ObjectId(user_id), "client_id": current_user.client_id})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found or not in your client")
+    if not user["is_active"]:
+        raise HTTPException(status_code=400, detail="User is already inactive")
     result = await db.users.update_one(
         {"_id": ObjectId(user_id), "client_id": current_user.client_id},
         {"$set": {"is_active": False}}
     )
     if result.modified_count == 0:
-        raise HTTPException(status_code=404, detail="User not found or not in your client")
+        raise HTTPException(status_code=500, detail="Failed to deactivate user")
     return {"message": "User deactivated successfully"}
 
 @app.post("/users/{user_id}/assign_project", tags=["User Management"])
@@ -835,16 +845,21 @@ async def update_project(project_id: str, project: ProjectCreate, current_user: 
 @app.get("/project/{project_id}", tags=["Project Management"])
 async def get_project(project_id: str, current_user: User = Depends(get_current_user)):
     try:
-        project = await db.projects.find_one({"_id": ObjectId(project_id), "client_id": current_user.client_id})
-        if not project:
-            raise HTTPException(status_code=404, detail="Project not found or not in your client")
-        
-        project["_id"] = str(project["_id"])
-        if "repo_analyses" in project:
-            project["repo_analyses"] = [{"repo_url": analysis["repo_url"]} for analysis in project["repo_analyses"]]
-        return project
+        obj_id = ObjectId(project_id)
     except:
         raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    project = await db.projects.find_one({"_id": obj_id, "client_id": current_user.client_id})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or not in your client")
+    
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
+        raise HTTPException(status_code=403, detail="Not authorized to access this project")
+        
+    project["_id"] = str(project["_id"])
+    if "repo_analyses" in project:
+        project["repo_analyses"] = [{"repo_url": analysis["repo_url"]} for analysis in project["repo_analyses"]]
+    return project
 
 @app.delete("/project/{project_id}", tags=["Project Management"])
 async def delete_project(project_id: str, current_user: User = Depends(get_current_admin_user)):
@@ -1335,6 +1350,8 @@ def create_agent(rag_id, agent_type, instructions, project_name):
             "llm_credential_id": "lyzr_openai",
             "provider_id": "OpenAI",
             "model": "gpt-4o-mini",
+            # "provider_id": "AWS-Bedrock [TEST]",
+            # "model": "bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
             "temperature": 0.7,
             "top_p": 0.9,
             "features": [

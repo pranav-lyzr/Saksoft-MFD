@@ -26,7 +26,6 @@ class RepositoryAnalyzer:
         self.semaphore = asyncio.Semaphore(5)  # Limit to 5 concurrent API calls
 
     async def _call_lyzr_api_async(self, client: httpx.AsyncClient, agent_id: str, session_id: str, system_prompt: str, message: str) -> str:
-        """Asynchronous helper function to call Lyzr API"""
         async with self.semaphore:
             messages = json.dumps([
                 {"role": "system", "content": system_prompt},
@@ -40,8 +39,21 @@ class RepositoryAnalyzer:
             }
             try:
                 response = await client.post(self.api_url, headers=self.headers, json=payload)
-                response.raise_for_status()
-                return response.json().get("response", "")
+                print(f"API request to {self.api_url} returned status {response.status_code}")
+                if response.status_code == 200:
+                    try:
+                        json_response = response.json()
+                        print(f"Full JSON response: {json_response}")
+                        if "error" in json_response:
+                            print(f"API returned error: {json_response['error']}")
+                            return json.dumps({"error": json_response['error']})
+                        return json_response.get("response", "")
+                    except json.JSONDecodeError:
+                        print(f"Response is not JSON: {response.text}")
+                        return ""
+                else:
+                    print(f"Non-200 status code: {response.status_code}, Response: {response.text}")
+                    response.raise_for_status()
             except Exception as e:
                 print(f"Request failed: {str(e)}")
                 return json.dumps({"error": str(e)})
@@ -411,18 +423,24 @@ class RepositoryAnalyzer:
             
             
             # API call with timeout and retry
-            try:
-                rag_response = await self._call_lyzr_api_async(
-                    client,
-                    agent_id="67c48f268cfac3392e3a48e2",
-                    session_id="67c48f268cfac3392e3a48e2",
-                    system_prompt=system_prompt,
-                    message=user_prompt
-                )
-            except httpx.HTTPStatusError as e:
-                print(f"HTTP error {e.response.status_code} for {file_path}")
+           
+            rag_response = await self._call_lyzr_api_async(
+                client,
+                agent_id="67c48f268cfac3392e3a48e2",
+                session_id="67c48f268cfac3392e3a48e2",
+                system_prompt=system_prompt,
+                message=user_prompt
+            )
+            print(f"Raw API response for {file_path}: '{rag_response}'")
+            if not rag_response or rag_response.strip() == "":
+                print(f"Empty response from API for {file_path}")
                 return None
-            rag_response=json.loads(rag_response.replace('```json', '').replace('```', ''))
+            try:
+                parsed_response = json.loads(rag_response.replace('```json', '').replace('```', ''))
+            except json.JSONDecodeError as e:
+                print(f"Invalid JSON response for {file_path}: {rag_response}")
+                return None
+            # rag_response=json.loads(rag_response.replace('```json', '').replace('```', ''))
             
 
             print("rag_response",rag_response)
@@ -438,7 +456,7 @@ class RepositoryAnalyzer:
                 "file_path": os.path.relpath(file_path, repo_dir),
                 "file_name": os.path.basename(file_path),
                 "file_type": os.path.splitext(file_path)[1][1:].lower(),
-                "rag_metadata": rag_response,
+                "rag_metadata": parsed_response,
                 "analysis_date": datetime.now().isoformat()
             }
 
