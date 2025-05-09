@@ -50,8 +50,10 @@ LYZR_AGENT_API_URL = "https://agent-prod.studio.lyzr.ai/v3/agent"
 LYZR_API_URL = "https://agent-prod.studio.lyzr.ai/v3/inference/chat/"
 API_KEY = "sk-default-yStV4gbpjadbQSw4i7QhoOLRwAs5dEcl"
 USER_ID = "pranav@lyzr.ai"
+CODE_SUGGESTION_AGENT_ID = "681d9176f023a41a090f2a4b"
 
-# Pydantic Models (unchanged)
+
+# Pydantic Models
 class ClientCreate(BaseModel):
     name: str
     admin_username: str
@@ -172,7 +174,6 @@ class UserWithSessionsAndChats(BaseModel):
     chat_sessions: List[ChatSession]
     chat_messages: List[Message]
 
-# New Pydantic Model for Project Response
 class ProjectResponse(BaseModel):
     id: str
     name: str
@@ -180,12 +181,32 @@ class ProjectResponse(BaseModel):
     created_by: str
     created_at: datetime
     github_links: List[dict]
-    repo_analyses: List[dict]  # Simplified to avoid large data
+    repo_analyses: List[dict]
     documentation: List[dict]
 
     class Config:
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
+
+
+class ChangeRequest(BaseModel):
+    description: str
+
+class DocumentationResponse(BaseModel):
+    content: str
+    timestamp: datetime
+
+class ImpactAnalysisResponse(BaseModel):
+    content: str
+    timestamp: datetime
+
+
+class CodeSuggestionRequest(BaseModel):
+    context: str
+
+class CodeSuggestionResponse(BaseModel):
+    coding_language: str
+    suggestions: List[str]
 
 # JWT Configuration
 SECRET_KEY = os.environ.get("SECRET_KEY", "your-secret-key")
@@ -259,7 +280,7 @@ async def check_project_access(project_id: str, current_user: User = Depends(get
     
     project = await db.projects.find_one({"_id": obj_id, "client_id": current_user.client_id})
     if not project:
-        raise HTTPException(status_code=404, detail="Project not found or not in your client")
+        raise HTTPException(status_code=404, detail="Project Marsden not found or not in your client")
     
     if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
@@ -270,7 +291,12 @@ async def validate_special_key(special_key: str = Header(...)):
         raise HTTPException(status_code=403, detail="Invalid special key")
     return special_key
 
-# Client Management Endpoints (Secret Key Required)
+async def get_current_admin_or_project_admin_user(current_user: User = Depends(get_current_user)):
+    if current_user.user_type not in [UserType.admin, UserType.project_admin]:
+        raise HTTPException(status_code=403, detail="Operation permitted only for admins and project admins")
+    return current_user
+
+# Client Management Endpoints
 @app.post("/clients", response_model=Client, tags=["Client Management"])
 async def create_client(client_data: ClientCreate):
     if client_data.special_key != "lyzr-saksoft":
@@ -294,6 +320,7 @@ async def create_client(client_data: ClientCreate):
     new_client = {
         "name": client_data.name,
         "admin_id": admin_id,
+        "secret_key": client_data.special_key,
         "created_at": datetime.utcnow()
     }
     client_result = await db.clients.insert_one(new_client)
@@ -346,7 +373,8 @@ async def delete_client(client_id: str, special_key: str = Depends(validate_spec
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Client not found")
     return {"message": "Client and all associated data deleted successfully"}
-# Authentication Endpoints (No Secret Key)
+
+# Authentication Endpoints
 @app.post("/login", response_model=Token, tags=["Authentication"])
 async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
     user = await db.users.find_one({"username": form_data.username})
@@ -372,7 +400,6 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 @app.post("/users", response_model=User, tags=["User Management"])
 async def create_user(user: UserCreate, current_user: User = Depends(get_current_admin_user)):
-    # Check if the username already exists within the same client
     existing_user = await db.users.find_one({
         "username": user.username,
         "client_id": current_user.client_id
@@ -380,10 +407,9 @@ async def create_user(user: UserCreate, current_user: User = Depends(get_current
     if existing_user:
         raise HTTPException(
             status_code=400,
-            detail="Username already registered under this client. Please choose a different username."
+            detail="Username already registered under this client."
         )
     
-    # Proceed with user creation if username is unique
     hashed_password = pwd_context.hash(user.password)
     new_user = {
         "username": user.username,
@@ -394,7 +420,18 @@ async def create_user(user: UserCreate, current_user: User = Depends(get_current
         "client_id": current_user.client_id
     }
     result = await db.users.insert_one(new_user)
-    created_user = await db.users.find_one({"_id": result.inserted_id})
+    user_id = result.inserted_id
+
+    # If the user is an admin, assign all existing projects for the client
+    if user.user_type == UserType.admin:
+        project_ids = await db.projects.distinct("_id", {"client_id": current_user.client_id})
+        if project_ids:
+            await db.users.update_one(
+                {"_id": user_id},
+                {"$addToSet": {"projects": {"$each": project_ids}}}
+            )
+
+    created_user = await db.users.find_one({"_id": user_id})
     return User(
         id=str(created_user["_id"]),
         username=created_user["username"],
@@ -403,7 +440,6 @@ async def create_user(user: UserCreate, current_user: User = Depends(get_current
         projects=[str(pid) for pid in created_user.get("projects", [])],
         client_id=created_user["client_id"]
     )
-
 
 @app.get("/users", response_model=List[User], tags=["User Management"])
 async def read_users(current_user: User = Depends(get_current_user)):
@@ -415,7 +451,7 @@ async def read_users(current_user: User = Depends(get_current_user)):
             "projects": {"$in": project_ids},
             "client_id": current_user.client_id
         }).to_list(None)
-    else:  # developer
+    else:
         users = [await db.users.find_one({"_id": ObjectId(current_user.id)})]
     
     return [
@@ -453,18 +489,17 @@ async def read_user(user_id: str, current_user: User = Depends(get_current_user)
     elif current_user.user_type == UserType.project_admin:
         if not set(current_user.projects).intersection(user_model.projects) and user_id != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to view this user")
-    else:  # developer
+    else:
         if user_id != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to view this user")
     
     sessions = await db.chat_sessions.find({"user_id": user_id}).to_list(None)
-    # Convert project_id to string when creating ChatSession instances
     chat_sessions = [
         ChatSession(
             id=str(session["_id"]),
             agent_session_id=session["agent_session_id"],
             user_id=session["user_id"],
-            project_id=str(session["project_id"]),  # Convert ObjectId to string
+            project_id=str(session["project_id"]),
             type=session["type"],
             created_at=session["created_at"],
             updated_at=session["updated_at"]
@@ -488,7 +523,6 @@ async def read_user(user_id: str, current_user: User = Depends(get_current_user)
         chat_sessions=chat_sessions,
         chat_messages=chat_messages
     )
-
 
 @app.put("/users/{user_id}", response_model=User, tags=["User Management"])
 async def update_user(user_id: str, user_update: UserUpdate, current_user: User = Depends(get_current_admin_user)):
@@ -600,39 +634,18 @@ async def remove_project(user_id: str, assignment: ProjectAssignment, current_us
         raise HTTPException(status_code=404, detail="User not found or project not assigned")
     return {"message": "Project removed successfully"}
 
-
-async def get_current_admin_or_project_admin_user(current_user: User = Depends(get_current_user)):
-    if current_user.user_type not in [UserType.admin, UserType.project_admin]:
-        raise HTTPException(status_code=403, detail="Operation permitted only for admins and project admins")
-    return current_user
-
-
-
-# Project Management APIs (No Secret Key)
-# New Endpoint: Fetch All Projects
-@app.get("/projects", response_model=List[ProjectResponse], tags=["Project Management"], summary="List all accessible projects")
+# Project Management APIs
+@app.get("/projects", response_model=List[ProjectResponse], tags=["Project Management"])
 async def list_projects(current_user: User = Depends(get_current_admin_or_project_admin_user)):
-    """
-    Retrieve all projects accessible to the logged-in user.
-    - Admins: Get all projects within their client.
-    - Project Admins: Get only their assigned projects within their client.
-    Requires JWT authentication.
-    """
     if current_user.user_type == UserType.admin:
-        # Fetch all projects for the client
         projects = await db.projects.find({"client_id": current_user.client_id}).to_list(None)
-    else:  # UserType.project_admin
-        # Fetch only projects assigned to the project admin
+    else:
         project_ids = [ObjectId(pid) for pid in current_user.projects]
         projects = await db.projects.find({
             "_id": {"$in": project_ids},
-            "client_id": current_user.client_id  # Ensure client scoping
+            "client_id": current_user.client_id
         }).to_list(None)
     
-    if not projects:
-        return []  # Return empty list if no projects found
-
-    # Format response
     return [
         ProjectResponse(
             id=str(project["_id"]),
@@ -641,17 +654,52 @@ async def list_projects(current_user: User = Depends(get_current_admin_or_projec
             created_by=project["created_by"],
             created_at=project["created_at"],
             github_links=project.get("github_links", []),
-            repo_analyses=[{"repo_url": analysis["repo_url"]} for analysis in project.get("repo_analyses", [])],  # Simplified
+            repo_analyses=[{"repo_url": analysis["repo_url"]} for analysis in project.get("repo_analyses", [])],
+            documentation=project.get("documentation", [])
+        )
+        for project in projects
+    ]
+
+@app.get("/users/{user_id}/projects", response_model=List[ProjectResponse], tags=["Project Management"])
+async def get_user_projects(user_id: str, current_user: User = Depends(get_current_user)):
+    try:
+        user = await db.users.find_one({"_id": ObjectId(user_id), "client_id": current_user.client_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found or not in your client")
+    except:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
+    
+    if current_user.user_type == UserType.admin:
+        pass
+    elif current_user.user_type == UserType.project_admin:
+        if not set(current_user.projects).intersection(user.get("projects", [])) and user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this user's projects")
+    else:
+        if user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this user's projects")
+    
+    project_ids = [ObjectId(pid) for pid in user.get("projects", [])]
+    projects = await db.projects.find({
+        "_id": {"$in": project_ids},
+        "client_id": current_user.client_id
+    }).to_list(None)
+    
+    return [
+        ProjectResponse(
+            id=str(project["_id"]),
+            name=project["name"],
+            client_id=project["client_id"],
+            created_by=project["created_by"],
+            created_at=project["created_at"],
+            github_links=project.get("github_links", []),
+            repo_analyses=[{"repo_url": analysis["repo_url"]} for analysis in project.get("repo_analyses", [])],
             documentation=project.get("documentation", [])
         )
         for project in projects
     ]
 
 @app.post("/create_project", tags=["Project Management"])
-async def create_project(project: ProjectCreate, current_user: User = Depends(get_current_user)):
-    if current_user.user_type not in [UserType.admin, UserType.project_admin]:
-        raise HTTPException(status_code=403, detail="Only admins and project admins can create projects")
-    
+async def create_project(project: ProjectCreate, current_user: User = Depends(get_current_admin_or_project_admin_user)):
     new_project = {
         "name": project.name,
         "github_links": [],
@@ -661,14 +709,30 @@ async def create_project(project: ProjectCreate, current_user: User = Depends(ge
         "created_at": datetime.utcnow()
     }
     result = await db.projects.insert_one(new_project)
+    project_id = result.inserted_id
     
+    # Automatically assign project to all admins
+    admin_users = await db.users.find({
+        "client_id": current_user.client_id,
+        "user_type": UserType.admin
+    }).to_list(None)
+    
+    if admin_users:
+        admin_ids = [admin["_id"] for admin in admin_users]
+        await db.users.update_many(
+            {"_id": {"$in": admin_ids}},
+            {"$addToSet": {"projects": project_id}}
+        )
+    
+    # Assign to project_admin if they created it
     if current_user.user_type == UserType.project_admin:
         await db.users.update_one(
             {"_id": ObjectId(current_user.id)},
-            {"$push": {"projects": str(result.inserted_id)}}
+            {"$addToSet": {"projects": project_id}}
         )
     
-    return {"project_id": str(result.inserted_id), "message": "Project created successfully"}
+    return {"project_id": str(project_id), "message": "Project created successfully"}
+
 
 @app.post("/project/{project_id}/repo", tags=["Project Management"])
 async def add_github_link(project_id: str, link: GitHubLink, current_user: User = Depends(get_current_user)):
@@ -863,12 +927,39 @@ async def get_project(project_id: str, current_user: User = Depends(get_current_
 
 @app.delete("/project/{project_id}", tags=["Project Management"])
 async def delete_project(project_id: str, current_user: User = Depends(get_current_admin_user)):
-    result = await db.projects.delete_one({"_id": ObjectId(project_id), "client_id": current_user.client_id})
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    # Delete associated chat sessions and messages
+    session_ids = await db.chat_sessions.distinct("_id", {"project_id": obj_id})
+    await db.chat_sessions.delete_many({"project_id": obj_id})
+    await db.chat_messages.delete_many({"session_id": {"$in": session_ids}})
+
+    # Remove project from users' project lists
+    await db.users.update_many(
+        {"projects": obj_id},
+        {"$pull": {"projects": obj_id}}
+    )
+
+    # Delete RAG collection if it exists
+    project = await db.projects.find_one({"_id": obj_id})
+    if project and "rag_id" in project:
+        try:
+            requests.delete(
+                f"{LYZR_RAG_API_URL}/{project['rag_id']}/",
+                headers={"x-api-key": API_KEY}
+            )
+        except:
+            pass  # Log error but don't fail deletion
+
+    result = await db.projects.delete_one({"_id": obj_id, "client_id": current_user.client_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
-    return {"message": "Project deleted successfully"}
+    return {"message": "Project and associated data deleted successfully"}
 
-# Code Operations APIs (No Secret Key)
+# Code Operations APIs
 @app.post("/chat_sessions", tags=["Code Operations"])
 async def create_chat_session(
     project_id: str,
@@ -1020,7 +1111,7 @@ async def generate_in_session(session_id: str, query: AgentQuery, current_user: 
         "type": "generate"
     }
 
-# Utility Functions (unchanged)
+# Utility Functions
 def chunk_text(text: str, max_tokens: int = 7000) -> List[str]:
     encoder = tiktoken.get_encoding("cl100k_base")
     tokens = encoder.encode(text)
@@ -1030,25 +1121,18 @@ def chunk_text(text: str, max_tokens: int = 7000) -> List[str]:
         chunks.append(encoder.decode(chunk_tokens))
     return chunks
 
-# ... (Previous imports and setup remain unchanged)
-
 async def analyze_repository_background(project_id: ObjectId, repo_url: str, source_name: str, pat: Optional[str] = None):
     temp_dir = tempfile.mkdtemp()
-    print(f"Created temporary directory: {temp_dir}")
     try:
-        # Clone the repository
         if pat:
             parsed_url = repo_url.replace("https://", f"https://{pat}@")
         else:
             parsed_url = repo_url
         Repo.clone_from(parsed_url, temp_dir)
                 
-        # Analyze the repository
         analysis_result = await analyzer.analyze_repository(temp_dir)
         result_dict = json.loads(json.dumps(analysis_result, default=str))
-        print(f"Analysis completed. Keys in result_dict: {list(result_dict.keys())}")
 
-        # Combine all analysis data into one text block
         combined_text = ""
         if result_dict.get("db_schemas"):
             combined_text += f"DB Schemas:\n{json.dumps(result_dict['db_schemas'])}\n\n"
@@ -1064,10 +1148,8 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             combined_text += f"RAG Data:\n{rag_text}\n\n"
 
         if not combined_text.strip():
-            print(f"No text content to chunk for repository {source_name}")
             combined_text = "No analyzable content found in repository."
 
-        print(f"Processing repository {source_name} with {len(combined_text)} characters")
         text_chunks = chunk_text(combined_text)
         chunked_documents = [
             {
@@ -1080,10 +1162,7 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             }
             for chunk in text_chunks
         ]
-        print(f"Added {len(text_chunks)} chunks from {source_name}")
-        print(f"Total chunked documents prepared: {len(chunked_documents)}")
 
-        # Store analysis results in the database
         analysis_entry = {
             "repo_url": repo_url,
             "source_name": source_name,
@@ -1098,147 +1177,492 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             {"_id": project_id},
             {"$push": {"repo_analyses": analysis_entry}}
         )
-        print("Database updated with analysis result and chunk metadata")
 
-        # Fetch project to check RAG status
         project = await db.projects.find_one({"_id": project_id})
         if not project:
             raise Exception("Project not found")
         project_name = project["name"]
 
         if not chunked_documents:
-            print("No chunked documents available for RAG training")
-            return  # Exit early if there's nothing to train
+            return
 
-        print(f"Preparing to train RAG with {len(chunked_documents)} documents")
-
-        # Handle RAG and agent creation logic
         if "rag_id" not in project:
-            # Step 1: Create RAG collection if it doesn't exist
             rag_id = create_rag_collection()
             if not rag_id:
                 raise Exception("Failed to create RAG collection")
-            print(rag_id)
-            # Step 2: Train the new RAG with documents
+            
             if not train_rag(rag_id, chunked_documents):
                 raise Exception("Failed to train RAG collection")
 
-            # Step 3: Create agents only for a new RAG
             search_agent = create_agent(rag_id, "search", SEARCH_INSTRUCTIONS, project_name)
             generate_agent = create_agent(rag_id, "generate", GENERATE_INSTRUCTIONS, project_name)
 
-            # Step 4: Validate agent creation
             if not search_agent or not isinstance(search_agent, dict) or "agent_id" not in search_agent:
                 raise Exception("Failed to create search agent")
             if not generate_agent or not isinstance(generate_agent, dict) or "agent_id" not in generate_agent:
                 raise Exception("Failed to create generate agent")
 
-            # Step 5: Update project with RAG and agent IDs
             update_data = {
                 "rag_id": rag_id,
                 "search_agent_id": search_agent["agent_id"],
                 "generate_agent_id": generate_agent["agent_id"]
             }
             await db.projects.update_one({"_id": project_id}, {"$set": update_data})
-            print(f"New RAG created (ID: {rag_id}) and agents initialized")
         else:
-            # If RAG exists, just train it with new documents
             rag_id = project["rag_id"]
             if not train_rag(rag_id, chunked_documents):
                 raise Exception("Failed to train existing RAG collection")
-            print(f"Trained existing RAG (ID: {rag_id}) with new documents")
 
     except Exception as e:
-        print(f"Error in analyze_repository_background: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Repository analysis failed: {str(e)}")
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
-        print("Cleanup completed")
 
-# # Utility Functions (Updated for better error handling)
-# def create_rag_collection():
-#     try:
-#         response = requests.post(
-#             f"{LYZR_RAG_API_URL}/",
-#             headers={"x-api-key": API_KEY},
-#             json={
-#                 "user_id": USER_ID,
-#                 "llm_credential_id": "lyzr_openai",
-#                 "embedding_credential_id": "lyzr_openai",
-#                 "vector_db_credential_id": "lyzr_weaviate",
-#                 "vector_store_provider": "Weaviate [Lyzr]",
-#                 "description": "Repository analysis RAG",
-#                 "collection_name": f"repo_rag_{int(time.time())}",
-#                 "llm_model": "gpt-4o-mini",
-#                 "embedding_model": "text-embedding-ada-002"
-#             }
-#         )
-#         if response.status_code != 200:
-#             print(f"RAG creation failed with status {response.status_code}: {response.text}")
-#             return None
-#         data = response.json()
-#         rag_id = data.get('id')
-#         if not rag_id:
-#             print(f"RAG creation response missing 'id': {data}")
-#             return None
-#         return rag_id
-#     except Exception as e:
-#         print(f"RAG creation failed: {str(e)}")
-#         return None
+def create_rag_collection():
+    try:
+        response = requests.post(
+            f"{LYZR_RAG_API_URL}/",
+            headers={"x-api-key": API_KEY},
+            json={
+                "user_id": USER_ID,
+                "llm_credential_id": "lyzr_openai",
+                "embedding_credential_id": "lyzr_openai",
+                "vector_db_credential_id": "lyzr_weaviate",
+                "vector_store_provider": "Weaviate [Lyzr]",
+                "description": "Repository analysis RAG",
+                "collection_name": f"repo_rag_{int(time.time())}",
+                "llm_model": "gpt-4o-mini",
+                "embedding_model": "text-embedding-ada-002"
+            }
+        )
+        return response.json().get('id')
+    except Exception as e:
+        print(f"RAG creation failed: {str(e)}")
+        return None
 
-# def train_rag(rag_id, documents):
-#     try:
-#         response = requests.post(
-#             f"{LYZR_RAG_API_URL}/train/{rag_id}/",
-#             headers={"x-api-key": API_KEY},
-#             json=documents
-#         )
-#         if response.status_code != 200:
-#             print(f"RAG training failed with status {response.status_code}: {response.text}")
-#             return False
-#         return True
-#     except Exception as e:
-#         print(f"RAG training failed: {str(e)}")
-#         return False
+def train_rag(rag_id, documents):
+    try:
+        response = requests.post(
+            f"{LYZR_RAG_API_URL}/train/{rag_id}/",
+            headers={"x-api-key": API_KEY},
+            json=documents
+        )
+        return response.status_code == 200
+    except Exception as e:
+        print(f"RAG training failed: {str(e)}")
+        return False
 
-# def create_agent(rag_id, agent_type, instructions, project_name):
-#     try:
-#         url = "https://agent-prod.studio.lyzr.ai/v3/agents/template/single-task"
-#         headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
-#         payload = {
-#             "name": f"repo_{project_name}_{agent_type}_agent",
-#             "description": f"repo_{project_name}_{agent_type}_agent",
-#             "agent_instructions": instructions,
-#             "agent_role": f"Agent for code {agent_type}",
-#             "llm_credential_id": "lyzr_openai",
-#             "provider_id": "OpenAI",
-#             "model": "gpt-4o-mini",
-#             "temperature": 0.7,
-#             "top_p": 0.9,
-#             "features": [
-#                 {
-#                     "type": "KNOWLEDGE_BASE",
-#                     "config": {"lyzr_rag": {"base_url": "https://rag-prod.studio.lyzr.ai", "rag_id": rag_id, "rag_name": "SakSoft Code Rag"}}
-#                 },
-#                 {"type": "SHORT_TERM_MEMORY", "config": {}},
-#                 {"type": "LONG_TERM_MEMORY", "config": {}}
-#             ],
-#             "tools": []
-#         }
-#         response = requests.post(url, headers=headers, json=payload)
-#         if response.status_code != 200:
-#             print(f"Agent creation failed for {agent_type} with status {response.status_code}: {response.text}")
-#             return None
-#         data = response.json()
-#         if "agent_id" not in data:
-#             print(f"Agent creation response missing 'agent_id' for {agent_type}: {data}")
-#             return None
-#         return data
-#     except Exception as e:
-#         print(f"Agent creation failed for {agent_type}: {str(e)}")
-#         return None
+def create_agent(rag_id, agent_type, instructions, project_name):
+    try:
+        url = "https://agent-prod.studio.lyzr.ai/v3/agents/template/single-task"
+        headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
+        payload = {
+            "name": f"repo_{project_name}_{agent_type}_agent",
+            "description": f"repo_{project_name}_{agent_type}_agent",
+            "agent_instructions": instructions,
+            "agent_role": f"Agent for code {agent_type}",
+            "llm_credential_id": "lyzr_openai",
+            "provider_id": "OpenAI",
+            "model": "gpt-4o-mini",
+            # "provider_id": "AWS-Bedrock [TEST]",
+            # "model": "bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "features": [
+                {
+                    "type": "KNOWLEDGE_BASE",
+                    "config": {
+                        "lyzr_rag": {
+                            "base_url": "https://rag-prod.studio.lyzr.ai",
+                            "rag_id": rag_id,
+                            "rag_name": "SakSoft Code Rag"
+                        }
+                    }
+                },
+                {"type": "SHORT_TERM_MEMORY", "config": {}},
+                {"type": "LONG_TERM_MEMORY", "config": {}}
+            ],
+            "tools": []
+        }
+        response = requests.post(url, headers=headers, json=payload)
+        if response.status_code != 200:
+            return None
+        data = response.json()
+        if "agent_id" not in data:
+            return None
+        return data
+    except Exception as e:
+        print(f"Agent creation failed for {agent_type}: {str(e)}")
+        return None
 
-# ... (Rest of the code remains unchanged)
+# Endpoint for Generating Technical Documentation
+@app.post("/project/{project_id}/technical_documentation", tags=["Code Operations"])
+async def generate_technical_documentation(project_id: str, current_user: User = Depends(get_current_user)):
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    project = await db.projects.find_one({"_id": obj_id, "client_id": current_user.client_id})
+
+    print("Project Details ", project)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or not in your client")
+    
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
+        raise HTTPException(status_code=403, detail="Not authorized to access this project")
+
+    if "generate_agent_id" not in project:
+        raise HTTPException(status_code=404, detail="Generate agent not configured for this project")
+
+    # Create a chat session for documentation generation
+    session_data = {
+        "user_id": current_user.id,
+        "project_id": obj_id,
+        "type": "technical",
+        "agent_session_id": str(uuid.uuid4()),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    session_result = await db.chat_sessions.insert_one(session_data)
+    session_id = session_result.inserted_id
+
+    # Define the prompt for technical documentation
+    prompt = """Generate a comprehensive technical documentation for the project based on the repository data in RAG. Include the following sections:
+    - Project Overview
+    - High-level structure of repositories
+    - Key components and their role
+    - Code flow and data interactions
+    - Dependencies and integration
+    - Architectural patterns and design decisions
+    - Interfaces and data structures
+    - Summary
+    - Any other points helpful for developers
+    Ensure all information is derived solely from the RAG data and follows the repository's conventions."""
+
+    user_message = {
+        "session_id": session_id,
+        "role": "user",
+        "content": prompt,
+        "timestamp": datetime.utcnow(),
+        "type": "technical"
+    }
+    await db.chat_messages.insert_one(user_message)
+
+    print("Agent ID", project["generate_agent_id"])
+    payload = {
+        "user_id": USER_ID,
+        "agent_id": project["generate_agent_id"],
+        "session_id": session_data["agent_session_id"],
+        "message": prompt
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            print(f"Technical documentation API request payload: {payload}")
+            response = await client.post(LYZR_API_URL, json=payload, headers={"x-api-key": API_KEY})
+            print(f"Technical documentation API response status: {response.status_code}")
+            print(f"Technical documentation API response: {response.text}")
+        assistant_response = response.json()
+        assistant_content = assistant_response.get("response", "No response from assistant")
+    except Exception as e:
+        print(f"Technical documentation API error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Generate agent API error: {str(e)}. Please try again later or contact Lyzr support.")
+
+    assistant_message = {
+        "session_id": session_id,
+        "role": "assistant",
+        "content": assistant_content,
+        "timestamp": datetime.utcnow(),
+        "type": "technical"
+    }
+    assistant_message_result = await db.chat_messages.insert_one(assistant_message)
+
+    await db.chat_sessions.update_one({"_id": session_id}, {"$set": {"updated_at": datetime.utcnow()}})
+
+    return {
+        "documentation": assistant_content
+    }
+
+# Endpoint for Generating Impact Analysis Report
+@app.post("/project/{project_id}/impact_analysis", tags=["Code Operations"])
+async def generate_impact_analysis(project_id: str, change_request: ChangeRequest, current_user: User = Depends(get_current_user)):
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    project = await db.projects.find_one({"_id": obj_id, "client_id": current_user.client_id})
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found or not in your client")
+    
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
+        raise HTTPException(status_code=403, detail="Not authorized to access this project")
+
+    if "generate_agent_id" not in project:
+        raise HTTPException(status_code=404, detail="Generate agent not configured for this project")
+
+    # Create a chat session for impact analysis
+    session_data = {
+        "user_id": current_user.id,
+        "project_id": obj_id,
+        "type": "impact",
+        "agent_session_id": str(uuid.uuid4()),
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
+    }
+    session_result = await db.chat_sessions.insert_one(session_data)
+    session_id = session_result.inserted_id
+
+    # Define the prompt for impact analysis
+    prompt = f"""Generate an impact analysis report for the following change in the project: '{change_request.description}'. Base the analysis solely on the repository data in RAG. Include the following sections:
+    - Summary
+    - Technical Impact (affected components, internal and external dependencies, database changes, API changes, etc.)
+    - Testing Requirements (unit tests, integration tests, regression tests)
+    - Security Considerations
+    - Performance Impact (memory, CPU, network, database, etc.)
+    - Deployment Considerations
+    - Rollback Plan
+    - Estimated Effort (development hours, testing hours, complexity score, etc.)
+    - Any Recommendations
+    Ensure all information is derived solely from the RAG data and follows the repository's conventions."""
+
+    user_message = {
+        "session_id": session_id,
+        "role": "user",
+        "content": prompt,
+        "timestamp": datetime.utcnow(),
+        "type": "impact"
+    }
+    await db.chat_messages.insert_one(user_message)
+
+    payload = {
+        "user_id": USER_ID,
+        "agent_id": project["generate_agent_id"],
+        "session_id": session_data["agent_session_id"],
+        "message": prompt
+    }
+
+    async def make_api_call():
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            print(f"Impact analysis API request payload: {payload}")
+            response = await client.post(LYZR_API_URL, json=payload, headers={"x-api-key": API_KEY})
+            print(f"Impact analysis API response status: {response.status_code}")
+            print(f"Impact analysis API response headers: {dict(response.headers)}")
+            print(f"Impact analysis API response: {response.text}")
+            if response.status_code == 500:
+                raise httpx.HTTPStatusError(
+                    message=f"API returned 500: {response.text}",
+                    request=response.request,
+                    response=response
+                )
+            response.raise_for_status()
+            return response
+
+    try:
+        response = await make_api_call()
+        assistant_response = response.json()
+        assistant_content = assistant_response.get("response", "No response from assistant")
+    except httpx.HTTPStatusError as e:
+        print(f"Impact analysis API failed after retries: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate impact analysis due to an issue with the Lyzr API (litellm error). Please try again later or contact Lyzr support."
+        )
+    except Exception as e:
+        print(f"Impact analysis API error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generate agent API error: {str(e)}. Please try again later or contact Lyzr support."
+        )
+
+    assistant_message = {
+        "session_id": session_id,
+        "role": "assistant",
+        "content": assistant_content,
+        "timestamp": datetime.utcnow(),
+        "type": "impact"
+    }
+    assistant_message_result = await db.chat_messages.insert_one(assistant_message)
+
+    await db.chat_sessions.update_one({"_id": session_id}, {"$set": {"updated_at": datetime.utcnow()}})
+
+    return {
+        "impact_analysis": assistant_content
+    }
+
+# Endpoint for Retrieving Technical Documentation
+@app.get("/project/{project_id}/technical_documentation", response_model=List[DocumentationResponse], tags=["Code Operations"])
+async def get_technical_documentation(project_id: str, current_user: User = Depends(get_current_user)):
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    # Check project access and existence
+    project = await check_project_access(project_id, current_user)
+    
+    # Find chat sessions for technical documentation created by the current user
+    sessions = await db.chat_sessions.find({
+        "project_id": obj_id,
+        "type": "technical",
+        "user_id": current_user.id
+    }).to_list(None)
+    if not sessions:
+        raise HTTPException(status_code=404, detail="No technical documentation found for this project created by you")
+
+    session_ids = [session["_id"] for session in sessions]
+    
+    # Fetch assistant messages with type "technical"
+    messages = await db.chat_messages.find({
+        "session_id": {"$in": session_ids},
+        "role": "assistant",
+        "type": "technical"
+    }).to_list(None)
+
+    if not messages:
+        raise HTTPException(status_code=404, detail="No technical documentation content found for this project created by you")
+
+    return [
+        DocumentationResponse(
+            content=message["content"],
+            timestamp=message["timestamp"]
+        )
+        for message in messages
+    ]
+
+# Endpoint for Retrieving Impact Analysis Reports
+@app.get("/project/{project_id}/impact_analysis", response_model=List[ImpactAnalysisResponse], tags=["Code Operations"])
+async def get_impact_analysis(project_id: str, current_user: User = Depends(get_current_user)):
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    # Check project access and existence
+    project = await check_project_access(project_id, current_user)
+    
+    # Find chat sessions for impact analysis created by the current user
+    sessions = await db.chat_sessions.find({
+        "project_id": obj_id,
+        "type": "impact",
+        "user_id": current_user.id
+    }).to_list(None)
+    if not sessions:
+        raise HTTPException(status_code=404, detail="No impact analysis reports found for this project created by you")
+
+    session_ids = [session["_id"] for session in sessions]
+    
+    # Fetch assistant messages with type "impact"
+    messages = await db.chat_messages.find({
+        "session_id": {"$in": session_ids},
+        "role": "assistant",
+        "type": "impact"
+    }).to_list(None)
+
+    if not messages:
+        raise HTTPException(status_code=404, detail="No impact analysis content found for this project created by you")
+
+    return [
+        ImpactAnalysisResponse(
+            content=message["content"],
+            timestamp=message["timestamp"]
+        )
+        for message in messages
+    ]
+
+# Endpoint for Code Suggestion
+@app.post("/code_suggestion", response_model=CodeSuggestionResponse, tags=["Code Operations"])
+async def code_suggestion(request: CodeSuggestionRequest, current_user: User = Depends(get_current_user)):
+    # Define the prompt for code suggestions
+    prompt =  f"""
+    ```
+    {request.context}
+    ```
+    """
+
+    payload = {
+        "user_id": USER_ID,
+        "agent_id": CODE_SUGGESTION_AGENT_ID,
+        "session_id": CODE_SUGGESTION_AGENT_ID,  # Temporary session ID for Lyzr API
+        "message": prompt
+    }
+    
+    async def make_api_call():
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            print(f"Code suggestion API request payload: {payload}")
+            response = await client.post(LYZR_API_URL, json=payload, headers={"x-api-key": API_KEY})
+            print(f"Code suggestion API response status: {response.status_code}")
+            print(f"Code suggestion API response headers: {dict(response.headers)}")
+            print(f"Code suggestion API response: {response.text}")
+            if response.status_code == 500:
+                raise httpx.HTTPStatusError(
+                    message=f"API returned 500: {response.text}",
+                    request=response.request,
+                    response=response
+                )
+            response.raise_for_status()
+            return response
+
+    try:
+        response = await make_api_call()
+        assistant_response = response.json()
+        assistant_content = assistant_response.get("response", {})
+        
+        # Check if assistant_content is a string (JSON-encoded) and parse it
+        if isinstance(assistant_content, str):
+            try:
+                assistant_content = json.loads(assistant_content)
+            except json.JSONDecodeError:
+                print("Failed to parse assistant response as JSON")
+                raise HTTPException(
+                    status_code=500,
+                    detail="Invalid response format from Lyzr API. Please try again or contact Lyzr support."
+                )
+        
+        # Validate response structure
+        if not isinstance(assistant_content, dict) or "coding_language" not in assistant_content or "suggestions" not in assistant_content:
+            print(f"Invalid response structure: {assistant_content}")
+            raise HTTPException(
+                status_code=500,
+                detail="Lyzr API returned an invalid response structure. Please try again or contact Lyzr support."
+            )
+
+        coding_language = assistant_content["coding_language"]
+        suggestions = assistant_content["suggestions"]
+
+        # Validate suggestions
+        if not isinstance(suggestions, list) or not (3 <= len(suggestions) <= 5) or not all(isinstance(s, str) for s in suggestions):
+            print(f"Invalid suggestions format or count: {suggestions}")
+            raise HTTPException(
+                status_code=500,
+                detail="Lyzr API returned invalid or insufficient suggestions. Please try again or contact Lyzr support."
+            )
+
+        return CodeSuggestionResponse(
+            coding_language=coding_language,
+            suggestions=suggestions
+        )
+
+    except httpx.HTTPStatusError as e:
+        print(f"Code suggestion API failed after retries: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to generate code suggestions due to an issue with the Lyzr API (possible litellm error). Please try again later or contact Lyzr support."
+        )
+    except Exception as e:
+        print(f"Code suggestion API error: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Generate agent API error: {str(e)}. Please try again later or contact Lyzr support."
+        )
+
+
+# Health Check
+@app.get("/health", tags=["System"])
+def health_check():
+    return {"status": "healthy"}
+
 SEARCH_INSTRUCTIONS = """# Code Repository RAG Assistant Instructions
 ## SEARCH INSTRUCTIONS
 Your TASK is to ASSIST users in finding SPECIFIC code elements within their codebase, using ONLY the information available in the provided code repository RAG. You MUST follow these STEPS:
@@ -1301,99 +1725,3 @@ Your TASK is to ASSIST users in finding SPECIFIC code elements within their code
    - VERIFY all responses against the repository data.
    - If asked about functionality not present in the repository, EXPLICITLY STATE that the information is not available rather than generating hypothetical answers.
 """
-
-
-def create_rag_collection():
-    try:
-        response = requests.post(
-            f"{LYZR_RAG_API_URL}/",
-            headers={"x-api-key": API_KEY},
-            json={
-                "user_id": USER_ID,
-                "llm_credential_id": "lyzr_openai",
-                "embedding_credential_id": "lyzr_openai",
-                "vector_db_credential_id": "lyzr_weaviate",
-                "vector_store_provider": "Weaviate [Lyzr]",
-                "description": "Repository analysis RAG",
-                "collection_name": f"repo_rag_{int(time.time())}",
-                "llm_model": "gpt-4o-mini",
-                "embedding_model": "text-embedding-ada-002"
-            }
-        )
-        return response.json().get('id')
-    except Exception as e:
-        print(f"RAG creation failed: {str(e)}")
-        return None
-
-def train_rag(rag_id, documents):
-    try:
-        response = requests.post(
-            f"{LYZR_RAG_API_URL}/train/{rag_id}/",
-            headers={"x-api-key": API_KEY},
-            json=documents
-        )
-        print("Training response",response)
-        return True
-    except Exception as e:
-        print(f"RAG training failed: {str(e)}")
-        return False
-
-def create_agent(rag_id, agent_type, instructions, project_name):
-    try:
-        url = "https://agent-prod.studio.lyzr.ai/v3/agents/template/single-task"
-        headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
-        payload = {
-            "name": f"repo_{project_name}_{agent_type}_agent",
-            "description": f"repo_{project_name}_{agent_type}_agent",
-            "agent_instructions": instructions,
-            "agent_role": f"Agent for code {agent_type}",
-            "llm_credential_id": "lyzr_openai",
-            "provider_id": "OpenAI",
-            "model": "gpt-4o-mini",
-            # "provider_id": "AWS-Bedrock [TEST]",
-            # "model": "bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
-            "temperature": 0.7,
-            "top_p": 0.9,
-            "features": [
-                {
-                    "type": "KNOWLEDGE_BASE",
-                    "config": {
-                        "lyzr_rag": {
-                            "base_url": "https://rag-prod.studio.lyzr.ai",
-                            "rag_id": rag_id,
-                            "rag_name": "SakSoft Code Rag"
-                        }
-                    },
-                    "priority": 0  # Highest priority for knowledge base
-                },
-                {
-                    "type": "SHORT_TERM_MEMORY",
-                    "config": {},
-                    "priority": 1  # Medium priority
-                },
-                {
-                    "type": "LONG_TERM_MEMORY",
-                    "config": {},
-                    "priority": 2  # Lowest priority
-                }
-            ],
-            "tools": []
-        }
-        response = requests.post(url, headers=headers, json=payload)
-        if response.status_code != 200:
-            print(f"Agent creation failed for {agent_type} with status {response.status_code}: {response.text}")
-            return None
-        data = response.json()
-        if "agent_id" not in data:
-            print(f"Agent creation response missing 'agent_id' for {agent_type}: {data}")
-            return None
-        print(f"Agent created successfully for {agent_type}: {data}")
-        return data
-    except Exception as e:
-        print(f"Agent creation failed for {agent_type}: {str(e)}")
-        return None
-
-# Health Check (No Secret Key)
-@app.get("/health", tags=["System"])
-def health_check():
-    return {"status": "healthy"}
