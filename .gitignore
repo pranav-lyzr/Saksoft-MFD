@@ -2,3 +2,5 @@
 Lib
 out
 .env
+analyzer
+__pycache__

@@ -692,11 +692,12 @@ async def get_user_projects(user_id: str, current_user: User = Depends(get_curre
             created_by=project["created_by"],
             created_at=project["created_at"],
             github_links=project.get("github_links", []),
-            repo_analyses=[{"repo_url": analysis["repo_url"]} for analysis in project.get("repo_analyses", [])],
+            repo_analyses=[{"repo_url": analysis["repo_url"], "source_name": analysis["source_name"]} for analysis in project.get("repo_analyses", [])],
             documentation=project.get("documentation", [])
         )
         for project in projects
     ]
+
 
 @app.post("/create_project", tags=["Project Management"])
 async def create_project(project: ProjectCreate, current_user: User = Depends(get_current_admin_or_project_admin_user)):
@@ -749,16 +750,40 @@ async def add_github_link(project_id: str, link: GitHubLink, current_user: User 
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     github_url_str = str(link.github_url)
-    github_link_data = {"url": github_url_str, "source_name": link.source_name}
-    if link.pat:
-        github_link_data["pat"] = link.pat
+    existing_link = next((gl for gl in project.get("github_links", []) if gl["url"] == github_url_str), None)
+    
+    if existing_link:
+        # Update existing link
+        update_data = {"source_name": link.source_name}
+        if link.pat:
+            update_data["pat"] = link.pat
+        await db.projects.update_one(
+            {"_id": obj_id, "github_links.url": github_url_str},
+            {"$set": {"github_links.$": {"url": github_url_str, **update_data}}}
+        )
+        # Delete existing RAG documents for this source
+        if "rag_id" in project:
+            try:
+                requests.delete(
+                    f"{LYZR_RAG_API_URL}/{project['rag_id']}/docs/",
+                    headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                    json=[existing_link["source_name"]]
+                )
+            except:
+                pass
+    else:
+        # Add new link
+        github_link_data = {"url": github_url_str, "source_name": link.source_name}
+        if link.pat:
+            github_link_data["pat"] = link.pat
+        await db.projects.update_one(
+            {"_id": obj_id},
+            {"$push": {"github_links": github_link_data}}
+        )
 
-    await db.projects.update_one(
-        {"_id": obj_id},
-        {"$push": {"github_links": github_link_data}}
-    )
     await analyze_repository_background(obj_id, github_url_str, link.source_name, link.pat)
-    return {"message": f"GitHub link '{link.source_name}' added successfully. Analysis started."}
+    return {"message": f"GitHub link '{link.source_name}' {'updated' if existing_link else 'added'} successfully. Analysis started."}
+
 
 @app.post("/project/{project_id}/documentation", tags=["Project Management"])
 async def add_documentation(project_id: str, input: DocumentationInput, current_user: User = Depends(get_current_user)):
@@ -777,6 +802,13 @@ async def add_documentation(project_id: str, input: DocumentationInput, current_
     if not input.text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
 
+    # Remove existing documentation for this source_name
+    await db.projects.update_one(
+        {"_id": obj_id},
+        {"$pull": {"documentation": {"source_name": input.source_name}}}
+    )
+
+    # Add new documentation
     await db.projects.update_one(
         {"_id": obj_id},
         {"$push": {"documentation": {"text": input.text, "source_name": input.source_name, "submitted_at": datetime.utcnow()}}}
@@ -797,6 +829,15 @@ async def add_documentation(project_id: str, input: DocumentationInput, current_
 
     if "rag_id" in project:
         rag_id = project["rag_id"]
+        # Delete existing RAG documents for this source
+        try:
+            requests.delete(
+                f"{LYZR_RAG_API_URL}/{rag_id}/docs/",
+                headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                json=[input.source_name]
+            )
+        except:
+            pass
         if not train_rag(rag_id, chunked_documents):
             raise HTTPException(status_code=500, detail="Failed to train RAG")
     else:
@@ -821,7 +862,8 @@ async def add_documentation(project_id: str, input: DocumentationInput, current_
         }
         await db.projects.update_one({"_id": obj_id}, {"$set": update_data})
 
-    return {"message": f"Documentation '{input.source_name}' added and RAG trained successfully"}
+    return {"message": f"Documentation '{input.source_name}' updated successfully"}
+
 
 @app.get("/project/{project_id}/rag/documents", tags=["Project Management"])
 async def get_rag_documents(project_id: str, current_user: User = Depends(get_current_user)):
@@ -906,7 +948,7 @@ async def update_project(project_id: str, project: ProjectCreate, current_user: 
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     return {"message": "Project updated successfully"}
 
-@app.get("/project/{project_id}", tags=["Project Management"])
+@app.get("/project/{project_id}", response_model=ProjectResponse, tags=["Project Management"])
 async def get_project(project_id: str, current_user: User = Depends(get_current_user)):
     try:
         obj_id = ObjectId(project_id)
@@ -920,10 +962,16 @@ async def get_project(project_id: str, current_user: User = Depends(get_current_
     if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
         
-    project["_id"] = str(project["_id"])
-    if "repo_analyses" in project:
-        project["repo_analyses"] = [{"repo_url": analysis["repo_url"]} for analysis in project["repo_analyses"]]
-    return project
+    return ProjectResponse(
+        id=str(project["_id"]),
+        name=project["name"],
+        client_id=project["client_id"],
+        created_by=project["created_by"],
+        created_at=project["created_at"],
+        github_links=project.get("github_links", []),
+        repo_analyses=[{"repo_url": analysis["repo_url"], "source_name": analysis["source_name"]} for analysis in project.get("repo_analyses", [])],
+        documentation=project.get("documentation", [])
+    )
 
 @app.delete("/project/{project_id}", tags=["Project Management"])
 async def delete_project(project_id: str, current_user: User = Depends(get_current_admin_user)):
@@ -1124,15 +1172,25 @@ def chunk_text(text: str, max_tokens: int = 7000) -> List[str]:
 async def analyze_repository_background(project_id: ObjectId, repo_url: str, source_name: str, pat: Optional[str] = None):
     temp_dir = tempfile.mkdtemp()
     try:
+        print(f"Starting repository analysis for project_id: {project_id}, repo_url: {repo_url}")
+        # Clone repository
+        print("Cloning repository...")
         if pat:
             parsed_url = repo_url.replace("https://", f"https://{pat}@")
         else:
             parsed_url = repo_url
         Repo.clone_from(parsed_url, temp_dir)
+        print("Repository cloned successfully")
                 
+        # Analyze repository
+        print("Analyzing repository...")
         analysis_result = await analyzer.analyze_repository(temp_dir)
+        print(f"Analysis result: {analysis_result}")
         result_dict = json.loads(json.dumps(analysis_result, default=str))
+        print("Analysis result serialized")
 
+        # Process analysis result
+        print("Processing analysis result...")
         combined_text = ""
         if result_dict.get("db_schemas"):
             combined_text += f"DB Schemas:\n{json.dumps(result_dict['db_schemas'])}\n\n"
@@ -1146,11 +1204,16 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
                 for item in result_dict["rag_data"] if isinstance(item, dict)
             )
             combined_text += f"RAG Data:\n{rag_text}\n\n"
+        print("Analysis result processed")
 
         if not combined_text.strip():
             combined_text = "No analyzable content found in repository."
+            print("No analyzable content found")
 
+        # Chunk text
+        print("Chunking text...")
         text_chunks = chunk_text(combined_text)
+        print(f"Text chunked: {len(text_chunks)} chunks")
         chunked_documents = [
             {
                 "id_": str(uuid.uuid4()),
@@ -1162,6 +1225,14 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             }
             for chunk in text_chunks
         ]
+        print(f"Created {len(chunked_documents)} documents")
+
+        # Update database - Remove existing analysis for this source_name
+        print("Updating database...")
+        await db.projects.update_one(
+            {"_id": project_id},
+            {"$pull": {"repo_analyses": {"source_name": source_name}}}
+        )
 
         analysis_entry = {
             "repo_url": repo_url,
@@ -1177,23 +1248,33 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             {"_id": project_id},
             {"$push": {"repo_analyses": analysis_entry}}
         )
+        print("Database updated")
 
+        # Fetch project
+        print("Fetching project...")
         project = await db.projects.find_one({"_id": project_id})
         if not project:
             raise Exception("Project not found")
         project_name = project["name"]
+        print(f"Project fetched: {project_name}")
 
+        # RAG and agent creation
+        print("Checking RAG...")
         if not chunked_documents:
+            print("No chunked documents to train RAG")
             return
 
         if "rag_id" not in project:
+            print("Creating RAG collection...")
             rag_id = create_rag_collection()
             if not rag_id:
                 raise Exception("Failed to create RAG collection")
             
+            print("Training RAG...")
             if not train_rag(rag_id, chunked_documents):
                 raise Exception("Failed to train RAG collection")
 
+            print("Creating search agent...")
             search_agent = create_agent(rag_id, "search", SEARCH_INSTRUCTIONS, project_name)
             generate_agent = create_agent(rag_id, "generate", GENERATE_INSTRUCTIONS, project_name)
 
@@ -1210,14 +1291,25 @@ async def analyze_repository_background(project_id: ObjectId, repo_url: str, sou
             await db.projects.update_one({"_id": project_id}, {"$set": update_data})
         else:
             rag_id = project["rag_id"]
+            # Delete existing RAG documents for this source
+            try:
+                requests.delete(
+                    f"{LYZR_RAG_API_URL}/{rag_id}/docs/",
+                    headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                    json=[source_name]
+                )
+            except:
+                pass
             if not train_rag(rag_id, chunked_documents):
                 raise Exception("Failed to train existing RAG collection")
-
     except Exception as e:
+        print(f"Repository analysis failed at {datetime.utcnow()}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Repository analysis failed: {str(e)}")
     finally:
+        print("Cleaning up temporary directory...")
         shutil.rmtree(temp_dir, ignore_errors=True)
 
+        
 def create_rag_collection():
     try:
         response = requests.post(
@@ -1235,6 +1327,7 @@ def create_rag_collection():
                 "embedding_model": "text-embedding-ada-002"
             }
         )
+        print("Response JSON for training JSON",response.json())
         return response.json().get('id')
     except Exception as e:
         print(f"RAG creation failed: {str(e)}")
@@ -1258,16 +1351,17 @@ def create_agent(rag_id, agent_type, instructions, project_name):
         headers = {"x-api-key": API_KEY, "Content-Type": "application/json"}
         payload = {
             "name": f"repo_{project_name}_{agent_type}_agent",
-            "description": f"repo_{project_name}_{agent_type}_agent",
-            "agent_instructions": instructions,
+            "description": f"Repository {agent_type} agent for {project_name}",
             "agent_role": f"Agent for code {agent_type}",
-            "llm_credential_id": "lyzr_openai",
+            "agent_instructions": instructions,
+            "examples": None,
+            "tool": "",
+            "tool_usage_description": "",
             "provider_id": "OpenAI",
             "model": "gpt-4o-mini",
-            # "provider_id": "AWS-Bedrock [TEST]",
-            # "model": "bedrock/us.anthropic.claude-3-5-sonnet-20240620-v1:0",
             "temperature": 0.7,
             "top_p": 0.9,
+            "llm_credential_id": "lyzr_openai",
             "features": [
                 {
                     "type": "KNOWLEDGE_BASE",
@@ -1275,16 +1369,34 @@ def create_agent(rag_id, agent_type, instructions, project_name):
                         "lyzr_rag": {
                             "base_url": "https://rag-prod.studio.lyzr.ai",
                             "rag_id": rag_id,
-                            "rag_name": "SakSoft Code Rag"
+                            "rag_name": "Saksoft Code RAG",
+                            "params": {
+                                "top_k": 10,
+                                "retrieval_type": "basic",
+                                "score_threshold": 0
+                            }
                         }
-                    }
+                    },
+                    "priority": 0
                 },
-                {"type": "SHORT_TERM_MEMORY", "config": {}},
-                {"type": "LONG_TERM_MEMORY", "config": {}}
+                {
+                    "type": "SHORT_TERM_MEMORY",
+                    "config": {},
+                    "priority": 0
+                },
+                {
+                    "type": "LONG_TERM_MEMORY",
+                    "config": {},
+                    "priority": 0
+                }
             ],
+            "managed_agents": [],
+            "response_format": {"type": "text"},
             "tools": []
         }
         response = requests.post(url, headers=headers, json=payload)
+        data = response.json()
+        print("Response from Creating Agent",data)
         if response.status_code != 200:
             return None
         data = response.json()
@@ -1313,7 +1425,7 @@ async def generate_technical_documentation(project_id: str, current_user: User =
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     if "generate_agent_id" not in project:
-        raise HTTPException(status_code=404, detail="Generate agent not configured for this project")
+        raise HTTPException(status_code=404, detail="Repo not added to the project")
 
     # Create a chat session for documentation generation
     session_data = {
@@ -1400,7 +1512,7 @@ async def generate_impact_analysis(project_id: str, change_request: ChangeReques
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     if "generate_agent_id" not in project:
-        raise HTTPException(status_code=404, detail="Generate agent not configured for this project")
+        raise HTTPException(status_code=404, detail="Repo not added to the project")
 
     # Create a chat session for impact analysis
     session_data = {
