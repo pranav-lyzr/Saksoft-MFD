@@ -296,15 +296,15 @@ async def get_current_admin_or_project_admin_user(current_user: User = Depends(g
         raise HTTPException(status_code=403, detail="Operation permitted only for admins and project admins")
     return current_user
 
-# Client Management Endpoints
-@app.post("/clients", response_model=Client, tags=["Client Management"])
+@app.post("/clients", response_model=Client, status_code=201, tags=["Client Management"])
 async def create_client(client_data: ClientCreate):
     if client_data.special_key != "lyzr-saksoft":
         raise HTTPException(status_code=403, detail="Invalid special key")
+
     existing_client = await db.clients.find_one({"name": client_data.name})
     if existing_client:
         raise HTTPException(status_code=400, detail="Client name already exists")
-    
+
     hashed_password = pwd_context.hash(client_data.admin_password)
     admin_data = {
         "username": client_data.admin_username,
@@ -333,6 +333,7 @@ async def create_client(client_data: ClientCreate):
         admin_id=str(new_client["admin_id"]),
         created_at=new_client["created_at"]
     )
+
 
 @app.get("/clients/{client_id}", response_model=Client, tags=["Client Management"])
 async def get_client(client_id: str, special_key: str = Depends(validate_special_key)):
@@ -612,6 +613,10 @@ async def assign_project(user_id: str, assignment: ProjectAssignment, current_us
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
+    # Check if project is already assigned to the user
+    if ObjectId(assignment.project_id) in [ObjectId(pid) for pid in user.get("projects", [])]:
+        raise HTTPException(status_code=400, detail="Project is already assigned to the user")
+    
     result = await db.users.update_one(
         {"_id": ObjectId(user_id)},
         {"$addToSet": {"projects": ObjectId(assignment.project_id)}}
@@ -701,6 +706,14 @@ async def get_user_projects(user_id: str, current_user: User = Depends(get_curre
 
 @app.post("/create_project", tags=["Project Management"])
 async def create_project(project: ProjectCreate, current_user: User = Depends(get_current_admin_or_project_admin_user)):
+    # Check for existing project with the same name in the client context
+    existing_project = await db.projects.find_one({
+        "name": project.name,
+        "client_id": current_user.client_id
+    })
+    if existing_project:
+        raise HTTPException(status_code=409, detail="Project name already exists for this client")
+    
     new_project = {
         "name": project.name,
         "github_links": [],
