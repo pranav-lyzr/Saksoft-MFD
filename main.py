@@ -51,6 +51,8 @@ LYZR_API_URL = "https://agent-prod.studio.lyzr.ai/v3/inference/chat/"
 API_KEY = "sk-default-yStV4gbpjadbQSw4i7QhoOLRwAs5dEcl"
 USER_ID = "pranav@lyzr.ai"
 CODE_SUGGESTION_AGENT_ID = "681d9176f023a41a090f2a4b"
+DEFAULT_GENERATE_AGENT_ID = "67c55dfe8cfac3392e3a4eb0"
+DEFAULT_SEARCH_AGENT_ID = "67c556420606a0f240481e79"
 
 
 # Pydantic Models
@@ -188,6 +190,11 @@ class ProjectResponse(BaseModel):
         arbitrary_types_allowed = True
         json_encoders = {ObjectId: str}
 
+class DeleteRepoByUrlRequest(BaseModel):
+    github_url: HttpUrl
+
+class DeleteDocumentationRequest(BaseModel):
+    source_name: str
 
 class ChangeRequest(BaseModel):
     description: str
@@ -703,6 +710,64 @@ async def get_user_projects(user_id: str, current_user: User = Depends(get_curre
         for project in projects
     ]
 
+@app.get("/users/{user_id}/projects/details", response_model=List[ProjectResponse], tags=["Project Management"])
+async def get_user_projects_details(user_id: str, current_user: User = Depends(get_current_user)):
+    """
+    Retrieve detailed information about all projects assigned to a specific user.
+    """
+    try:
+        user = await db.users.find_one({"_id": ObjectId(user_id), "client_id": current_user.client_id})
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found or not in your client")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID format")
+
+    # Authorization checks
+    if current_user.user_type == UserType.admin:
+        pass
+    elif current_user.user_type == UserType.project_admin:
+        if not set(current_user.projects).intersection(user.get("projects", [])) and user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this user's projects")
+    else:
+        if user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="Not authorized to view this user's projects")
+
+    # Fetch projects assigned to the user
+    project_ids = [ObjectId(pid) for pid in user.get("projects", [])]
+    projects = await db.projects.find({
+        "_id": {"$in": project_ids},
+        "client_id": current_user.client_id
+    }).to_list(None)
+
+    if not projects:
+        return []
+
+    # Format response with detailed project information
+    return [
+        ProjectResponse(
+            id=str(project["_id"]),
+            name=project["name"],
+            client_id=project["client_id"],
+            created_by=project["created_by"],
+            created_at=project["created_at"],
+            github_links=project.get("github_links", []),
+            repo_analyses=[
+                {
+                    "repo_url": analysis["repo_url"],
+                    "source_name": analysis["source_name"],
+                    "analyzed_at": analysis.get("analyzed_at"),
+                } for analysis in project.get("repo_analyses", [])
+            ],
+            documentation=[
+                {
+                    "text": doc["text"],
+                    "source_name": doc["source_name"],
+                    "submitted_at": doc.get("submitted_at")
+                } for doc in project.get("documentation", [])
+            ]
+        )
+        for project in projects
+    ]
 
 @app.post("/create_project", tags=["Project Management"])
 async def create_project(project: ProjectCreate, current_user: User = Depends(get_current_admin_or_project_admin_user)):
@@ -750,31 +815,39 @@ async def create_project(project: ProjectCreate, current_user: User = Depends(ge
 
 @app.post("/project/{project_id}/repo", tags=["Project Management"])
 async def add_github_link(project_id: str, link: GitHubLink, current_user: User = Depends(get_current_user)):
+    """
+    Add or update a GitHub repository link in a project, ensuring unique source_name within the project.
+    Only admins or users with access to the project can perform this action.
+    """
     try:
         obj_id = ObjectId(project_id)
     except:
         raise HTTPException(status_code=400, detail="Invalid project ID format")
 
-    project = await db.projects.find_one({"_id": obj_id, "client_id": current_user.client_id})
-    if not project:
-        raise HTTPException(status_code=404, detail="Project not found or not in your client")
-    
-    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
-        raise HTTPException(status_code=403, detail="Not authorized to access this project")
+    # Check project access
+    project = await check_project_access(project_id, current_user)
 
     github_url_str = str(link.github_url)
+    source_name = link.source_name
+
+    # Check for duplicate source_name
+    existing_source = next((gl for gl in project.get("github_links", []) if gl["source_name"] == source_name and gl["url"] != github_url_str), None)
+    if existing_source:
+        raise HTTPException(status_code=400, detail=f"Source name '{source_name}' is already used by another GitHub link in this project")
+
+    # Check if the GitHub link already exists
     existing_link = next((gl for gl in project.get("github_links", []) if gl["url"] == github_url_str), None)
-    
+
     if existing_link:
         # Update existing link
-        update_data = {"source_name": link.source_name}
+        update_data = {"source_name": source_name}
         if link.pat:
             update_data["pat"] = link.pat
         await db.projects.update_one(
             {"_id": obj_id, "github_links.url": github_url_str},
             {"$set": {"github_links.$": {"url": github_url_str, **update_data}}}
         )
-        # Delete existing RAG documents for this source
+        # Remove existing repo analyses and RAG documents for the old source_name
         if "rag_id" in project:
             try:
                 requests.delete(
@@ -782,11 +855,15 @@ async def add_github_link(project_id: str, link: GitHubLink, current_user: User 
                     headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
                     json=[existing_link["source_name"]]
                 )
-            except:
-                pass
+            except requests.RequestException as e:
+                raise HTTPException(status_code=500, detail=f"Failed to delete existing RAG documents: {str(e)}")
+        await db.projects.update_one(
+            {"_id": obj_id},
+            {"$pull": {"repo_analyses": {"source_name": existing_link["source_name"]}}}
+        )
     else:
         # Add new link
-        github_link_data = {"url": github_url_str, "source_name": link.source_name}
+        github_link_data = {"url": github_url_str, "source_name": source_name}
         if link.pat:
             github_link_data["pat"] = link.pat
         await db.projects.update_one(
@@ -794,9 +871,62 @@ async def add_github_link(project_id: str, link: GitHubLink, current_user: User 
             {"$push": {"github_links": github_link_data}}
         )
 
-    await analyze_repository_background(obj_id, github_url_str, link.source_name, link.pat)
-    return {"message": f"GitHub link '{link.source_name}' {'updated' if existing_link else 'added'} successfully. Analysis started."}
+    # Trigger background repository analysis
+    await analyze_repository_background(obj_id, github_url_str, source_name, link.pat)
+    return {"message": f"GitHub link '{source_name}' {'updated' if existing_link else 'added'} successfully. Analysis started."}
 
+@app.delete("/project/{project_id}/repo", tags=["Project Management"])
+async def delete_github_link_by_url(project_id: str, delete_request: DeleteRepoByUrlRequest, current_user: User = Depends(get_current_user)):
+    """
+    Delete a specific GitHub repository link, its associated RAG documents, repo analyses, and documentation from a project using the GitHub URL.
+    Only admins or users with access to the project can perform this action.
+    """
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    # Check project access
+    project = await check_project_access(project_id, current_user)
+
+    # Find the GitHub link by github_url
+    github_url_str = str(delete_request.github_url)
+    github_link = next((link for link in project.get("github_links", []) if link["url"] == github_url_str), None)
+    if not github_link:
+        raise HTTPException(status_code=404, detail=f"GitHub link with URL '{github_url_str}' not found")
+
+    source_name = github_link["source_name"]
+
+    # Remove the GitHub link, associated repo analyses, and documentation
+    update_result = await db.projects.update_one(
+        {"_id": obj_id},
+        {
+            "$pull": {
+                "github_links": {"url": github_url_str},
+                "repo_analyses": {"source_name": source_name},
+                "documentation": {"source_name": source_name}
+            }
+        }
+    )
+
+    # Verify that at least one field was modified
+    if update_result.modified_count == 0:
+        raise HTTPException(status_code=404, detail=f"No data associated with URL '{github_url_str}' or source_name '{source_name}' was found to delete")
+
+    # Delete RAG documents if RAG is configured
+    if "rag_id" in project:
+        rag_id = project["rag_id"]
+        try:
+            response = requests.delete(
+                f"{LYZR_RAG_API_URL}/{rag_id}/docs/",
+                headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                json=[source_name]
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete RAG documents for source_name '{source_name}': {str(e)}")
+
+    return {"message": f"GitHub link with URL '{github_url_str}', associated repo analyses, documentation, and RAG documents for source_name '{source_name}' deleted successfully"}
 
 @app.post("/project/{project_id}/documentation", tags=["Project Management"])
 async def add_documentation(project_id: str, input: DocumentationInput, current_user: User = Depends(get_current_user)):
@@ -878,6 +1008,54 @@ async def add_documentation(project_id: str, input: DocumentationInput, current_
     return {"message": f"Documentation '{input.source_name}' updated successfully"}
 
 
+@app.delete("/project/{project_id}/documentation", tags=["Project Management"])
+async def delete_documentation_by_source_name(project_id: str, delete_request: DeleteDocumentationRequest, current_user: User = Depends(get_current_user)):
+    """
+    Delete documentation entries and their associated RAG documents from a project using the source_name.
+    Only admins or users with access to the project can perform this action.
+    """
+    try:
+        obj_id = ObjectId(project_id)
+    except:
+        raise HTTPException(status_code=400, detail="Invalid project ID format")
+
+    # Check project access
+    project = await check_project_access(project_id, current_user)
+
+    # Verify that the source_name exists in the project's documentation
+    documentation_entry = next((doc for doc in project.get("documentation", []) if doc["source_name"] == delete_request.source_name), None)
+    if not documentation_entry:
+        raise HTTPException(status_code=404, detail=f"Documentation with source_name '{delete_request.source_name}' not found")
+
+    # Remove the documentation entry from MongoDB
+    update_result = await db.projects.update_one(
+        {"_id": obj_id},
+        {
+            "$pull": {
+                "documentation": {"source_name": delete_request.source_name}
+            }
+        }
+    )
+
+    # Verify that the documentation was removed
+    if update_result.modified_count == 0:
+        raise HTTPException(status_code=404, detail=f"No documentation with source_name '{delete_request.source_name}' was found to delete")
+
+    # Delete RAG documents if RAG is configured
+    if "rag_id" in project:
+        rag_id = project["rag_id"]
+        try:
+            response = requests.delete(
+                f"{LYZR_RAG_API_URL}/{rag_id}/docs/",
+                headers={"x-api-key": API_KEY, "Content-Type": "application/json"},
+                json=[delete_request.source_name]
+            )
+            response.raise_for_status()
+        except requests.RequestException as e:
+            raise HTTPException(status_code=500, detail=f"Failed to delete RAG documents for source_name '{delete_request.source_name}': {str(e)}")
+
+    return {"message": f"Documentation and associated RAG documents with source_name '{delete_request.source_name}' deleted successfully"}
+
 @app.get("/project/{project_id}/rag/documents", tags=["Project Management"])
 async def get_rag_documents(project_id: str, current_user: User = Depends(get_current_user)):
     try:
@@ -907,8 +1085,12 @@ async def get_rag_documents(project_id: str, current_user: User = Depends(get_cu
     except requests.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Failed to fetch RAG documents: {str(e)}")
 
-@app.delete("/project/{project_id}/rag/documents", tags=["Project Management"])
-async def delete_rag_documents(project_id: str, delete_request: DeleteRagDocuments, current_user: User = Depends(get_current_user)):
+@app.delete("/project/{project_id}/rag/documents/repository", tags=["Project Management"])
+async def delete_repository_rag_documents(
+    project_id: str, 
+    delete_request: DeleteRagDocuments, 
+    current_user: User = Depends(get_current_user)
+):
     try:
         obj_id = ObjectId(project_id)
     except:
@@ -927,29 +1109,50 @@ async def delete_rag_documents(project_id: str, delete_request: DeleteRagDocumen
     rag_id = project["rag_id"]
     source_name = delete_request.source_name
 
+    # Validate that the source_name exists in the project
+    github_links = project.get("github_links", [])
+    source_exists = any(link.get("source_name") == source_name for link in github_links)
+    
+    if not source_exists:
+        raise HTTPException(status_code=404, detail=f"Repository '{source_name}' not found in this project")
+
     try:
+        # Delete from Lyzr RAG API - note the correct payload format
         response = requests.delete(
             f"{LYZR_RAG_API_URL}/{rag_id}/docs/",
-            headers={"x-api-key": API_KEY, "accept": "application/json", "Content-Type": "application/json"},
-            json=[source_name]
+            headers={
+                "x-api-key": API_KEY, 
+                "accept": "application/json", 
+                "Content-Type": "application/json"
+            },
+            json=[source_name]  # Send as array of source names
         )
         response.raise_for_status()
+        print(f"RAG deletion response: {response.status_code} - {response.text}")
     except requests.RequestException as e:
+        print(f"RAG deletion failed: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to delete RAG documents: {str(e)}")
 
-    await db.projects.update_one(
+    # Remove from project's github_links and repo_analyses
+    update_result = await db.projects.update_one(
         {"_id": obj_id},
         {"$pull": {
             "github_links": {"source_name": source_name},
             "repo_analyses": {"source_name": source_name}
         }}
     )
+
+    # Remove from project's documentation if it exists
     await db.projects.update_one(
         {"_id": obj_id},
         {"$pull": {"documentation": {"source_name": source_name}}}
     )
 
-    return {"message": f"Deleted documents with source: '{source_name}' from RAG and project"}
+    return {
+        "message": f"Successfully deleted repository '{source_name}' from RAG and project",
+        "deleted_source": source_name,
+        "rag_id": rag_id
+    }
 
 @app.put("/project/{project_id}", tags=["Project Management"])
 async def update_project(project_id: str, project: ProjectCreate, current_user: User = Depends(get_current_admin_user)):
@@ -1060,21 +1263,13 @@ async def search_in_session(session_id: str, query: AgentQuery, current_user: Us
         raise HTTPException(status_code=403, detail="Not authorized to access this chat session")
 
     project = await db.projects.find_one({"_id": session["project_id"], "client_id": current_user.client_id})
-    if not project or "search_agent_id" not in project:
-        raise HTTPException(status_code=404, detail="Project or search agent not configured")
-
-    user_message = {
-        "session_id": obj_id,
-        "role": "user",
-        "content": query.message,
-        "timestamp": datetime.utcnow(),
-        "type": "search"
-    }
-    await db.chat_messages.insert_one(user_message)
-
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    search_agent_id = project.get("search_agent_id", DEFAULT_SEARCH_AGENT_ID)
     payload = {
         "user_id": USER_ID,
-        "agent_id": project["search_agent_id"],
+        "agent_id": search_agent_id,
         "session_id": session["agent_session_id"],
         "message": query.message
     }
@@ -1087,6 +1282,15 @@ async def search_in_session(session_id: str, query: AgentQuery, current_user: Us
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search agent API error: {str(e)}")
 
+    user_message = {
+        "session_id": obj_id,
+        "role": "user",
+        "content": query.message,
+        "timestamp": datetime.utcnow(),
+        "type": "search"
+    }
+    await db.chat_messages.insert_one(user_message)
+
     assistant_message = {
         "session_id": obj_id,
         "role": "assistant",
@@ -1097,7 +1301,6 @@ async def search_in_session(session_id: str, query: AgentQuery, current_user: Us
     assistant_message_result = await db.chat_messages.insert_one(assistant_message)
 
     await db.chat_sessions.update_one({"_id": obj_id}, {"$set": {"updated_at": datetime.utcnow()}})
-
     return {
         "id": str(assistant_message_result.inserted_id),
         "session_id": str(obj_id),
@@ -1125,21 +1328,13 @@ async def generate_in_session(session_id: str, query: AgentQuery, current_user: 
         raise HTTPException(status_code=403, detail="Not authorized to access this chat session")
 
     project = await db.projects.find_one({"_id": session["project_id"], "client_id": current_user.client_id})
-    if not project or "generate_agent_id" not in project:
-        raise HTTPException(status_code=404, detail="Project or generate agent not configured")
-
-    user_message = {
-        "session_id": obj_id,
-        "role": "user",
-        "content": query.message,
-        "timestamp": datetime.utcnow(),
-        "type": "generate"
-    }
-    await db.chat_messages.insert_one(user_message)
-
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+    
+    generate_agent_id = project.get("generate_agent_id", DEFAULT_GENERATE_AGENT_ID)
     payload = {
         "user_id": USER_ID,
-        "agent_id": project["generate_agent_id"],
+        "agent_id": generate_agent_id,
         "session_id": session["agent_session_id"],
         "message": query.message
     }
@@ -1152,6 +1347,15 @@ async def generate_in_session(session_id: str, query: AgentQuery, current_user: 
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Generate agent API error: {str(e)}")
 
+    user_message = {
+        "session_id": obj_id,
+        "role": "user",
+        "content": query.message,
+        "timestamp": datetime.utcnow(),
+        "type": "generate"
+    }
+    await db.chat_messages.insert_one(user_message)
+
     assistant_message = {
         "session_id": obj_id,
         "role": "assistant",
@@ -1162,7 +1366,6 @@ async def generate_in_session(session_id: str, query: AgentQuery, current_user: 
     assistant_message_result = await db.chat_messages.insert_one(assistant_message)
 
     await db.chat_sessions.update_one({"_id": obj_id}, {"$set": {"updated_at": datetime.utcnow()}})
-
     return {
         "id": str(assistant_message_result.inserted_id),
         "session_id": str(obj_id),
@@ -1437,8 +1640,8 @@ async def generate_technical_documentation(project_id: str, current_user: User =
     if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
-    if "generate_agent_id" not in project:
-        raise HTTPException(status_code=404, detail="Repo not added to the project")
+    # Use project's generate_agent_id if available, otherwise use default
+    generate_agent_id = project.get("generate_agent_id", DEFAULT_GENERATE_AGENT_ID)
 
     # Create a chat session for documentation generation
     session_data = {
@@ -1474,10 +1677,10 @@ async def generate_technical_documentation(project_id: str, current_user: User =
     }
     await db.chat_messages.insert_one(user_message)
 
-    print("Agent ID", project["generate_agent_id"])
+    print("Agent ID", generate_agent_id)
     payload = {
         "user_id": USER_ID,
-        "agent_id": project["generate_agent_id"],
+        "agent_id": generate_agent_id,
         "session_id": session_data["agent_session_id"],
         "message": prompt
     }
@@ -1524,8 +1727,8 @@ async def generate_impact_analysis(project_id: str, change_request: ChangeReques
     if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
-    if "generate_agent_id" not in project:
-        raise HTTPException(status_code=404, detail="Repo not added to the project")
+    # Use project's generate_agent_id if available, otherwise use default
+    generate_agent_id = project.get("generate_agent_id", DEFAULT_GENERATE_AGENT_ID)
 
     # Create a chat session for impact analysis
     session_data = {
@@ -1563,7 +1766,7 @@ async def generate_impact_analysis(project_id: str, change_request: ChangeReques
 
     payload = {
         "user_id": USER_ID,
-        "agent_id": project["generate_agent_id"],
+        "agent_id": generate_agent_id,
         "session_id": session_data["agent_session_id"],
         "message": prompt
     }
