@@ -51,8 +51,11 @@ LYZR_API_URL = "https://agent-prod.studio.lyzr.ai/v3/inference/chat/"
 API_KEY = "sk-default-yStV4gbpjadbQSw4i7QhoOLRwAs5dEcl"
 USER_ID = "pranav@lyzr.ai"
 CODE_SUGGESTION_AGENT_ID = "681d9176f023a41a090f2a4b"
-DEFAULT_GENERATE_AGENT_ID = "67c55dfe8cfac3392e3a4eb0"
+DEFAULT_GENERATE_AGENT_ID = "684a9ac6e5203d8a7b6482ad"
 DEFAULT_SEARCH_AGENT_ID = "67c556420606a0f240481e79"
+
+DEFAULT_IMPACT_ANALYSIS_ID="684a9ac6e5203d8a7b6482ad"
+DEFAULT_CODE_DOCUMENTATION_ID="684a9b16e5203d8a7b6482b1"
 
 
 # Pydantic Models
@@ -1641,7 +1644,7 @@ async def generate_technical_documentation(project_id: str, current_user: User =
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     # Use project's generate_agent_id if available, otherwise use default
-    generate_agent_id = project.get("generate_agent_id", DEFAULT_GENERATE_AGENT_ID)
+    generate_agent_id = project.get("generate_agent_id", DEFAULT_CODE_DOCUMENTATION_ID)
 
     # Create a chat session for documentation generation
     session_data = {
@@ -1728,7 +1731,7 @@ async def generate_impact_analysis(project_id: str, change_request: ChangeReques
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     # Use project's generate_agent_id if available, otherwise use default
-    generate_agent_id = project.get("generate_agent_id", DEFAULT_GENERATE_AGENT_ID)
+    generate_agent_id = project.get("generate_agent_id", DEFAULT_IMPACT_ANALYSIS_ID)
 
     # Create a chat session for impact analysis
     session_data = {
