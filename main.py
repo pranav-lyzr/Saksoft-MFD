@@ -21,6 +21,8 @@ import os
 from passlib.context import CryptContext
 from uuid import uuid4
 import tiktoken
+import ast
+import re
 
 app = FastAPI(
     title="Saksoft Coding Agent API",
@@ -1940,16 +1942,46 @@ async def code_suggestion(request: CodeSuggestionRequest, current_user: User = D
         assistant_response = response.json()
         assistant_content = assistant_response.get("response", {})
         
-        # Check if assistant_content is a string (JSON-encoded) and parse it
+        # Robustly parse assistant_content if it's a JSON-encoded string
         if isinstance(assistant_content, str):
             try:
+                # Try normal parsing
                 assistant_content = json.loads(assistant_content)
             except json.JSONDecodeError:
-                print("Failed to parse assistant response as JSON")
-                raise HTTPException(
-                    status_code=500,
-                    detail="Invalid response format from Lyzr API. Please try again or contact Lyzr support."
-                )
+                # Try to clean up common escape issues and parse again
+                try:
+                    cleaned = assistant_content.replace("\n", "").replace("\t", "").replace("\\\"", '"').replace("\\'", "'")
+                    assistant_content = json.loads(cleaned)
+                except Exception as e1:
+                    # Try ast.literal_eval as a last resort
+                    try:
+                        assistant_content = ast.literal_eval(assistant_content)
+                    except Exception as e2:
+                        # Fallback: Try to extract coding_language and suggestions manually
+                        print("Failed to robustly parse assistant response as JSON", e1, e2)
+                        print("Raw response string:", repr(assistant_content))
+                        try:
+                            # Extract coding_language
+                            lang_match = re.search(r'"coding_language"\s*:\s*"([^"]+)"', assistant_content)
+                            suggestions_match = re.search(r'"suggestions"\s*:\s*\[(.*)\]\s*}', assistant_content, re.DOTALL)
+                            if lang_match and suggestions_match:
+                                coding_language = lang_match.group(1)
+                                # Extract suggestions as a list of strings
+                                suggestions_raw = suggestions_match.group(1)
+                                # Split by ",\n        " but keep inner quotes
+                                suggestions = re.findall(r'"(.*?)"', suggestions_raw, re.DOTALL)
+                                assistant_content = {
+                                    "coding_language": coding_language,
+                                    "suggestions": suggestions
+                                }
+                            else:
+                                raise ValueError("Could not extract coding_language or suggestions")
+                        except Exception as e3:
+                            print("Manual extraction also failed", e3)
+                            raise HTTPException(
+                                status_code=500,
+                                detail="Invalid response format from Lyzr API. Please try again or contact Lyzr support."
+                            )
         
         # Validate response structure
         if not isinstance(assistant_content, dict) or "coding_language" not in assistant_content or "suggestions" not in assistant_content:
