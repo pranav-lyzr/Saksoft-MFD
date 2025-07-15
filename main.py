@@ -23,6 +23,7 @@ from uuid import uuid4
 import tiktoken
 import ast
 import re
+import asyncio
 
 app = FastAPI(
     title="Saksoft Coding Agent API",
@@ -1907,6 +1908,7 @@ async def get_impact_analysis(project_id: str, current_user: User = Depends(get_
 # Endpoint for Code Suggestion
 @app.post("/code_suggestion", response_model=CodeSuggestionResponse, tags=["Code Operations"])
 async def code_suggestion(request: CodeSuggestionRequest, current_user: User = Depends(get_current_user)):
+    import asyncio
     # Define the prompt for code suggestions
     prompt =  f"""
     ```
@@ -1937,88 +1939,102 @@ async def code_suggestion(request: CodeSuggestionRequest, current_user: User = D
             response.raise_for_status()
             return response
 
-    try:
-        response = await make_api_call()
-        assistant_response = response.json()
-        assistant_content = assistant_response.get("response", {})
-        
-        # Robustly parse assistant_content if it's a JSON-encoded string
-        if isinstance(assistant_content, str):
-            try:
-                # Try normal parsing
-                assistant_content = json.loads(assistant_content)
-            except json.JSONDecodeError:
-                # Try to clean up common escape issues and parse again
+    last_exception = None
+    for attempt in range(3):
+        try:
+            response = await make_api_call()
+            assistant_response = response.json()
+            assistant_content = assistant_response.get("response", {})
+            
+            # Robustly parse assistant_content if it's a JSON-encoded string
+            if isinstance(assistant_content, str):
                 try:
-                    cleaned = assistant_content.replace("\n", "").replace("\t", "").replace("\\\"", '"').replace("\\'", "'")
-                    assistant_content = json.loads(cleaned)
-                except Exception as e1:
-                    # Try ast.literal_eval as a last resort
+                    # Try normal parsing
+                    assistant_content = json.loads(assistant_content)
+                except json.JSONDecodeError:
+                    # Try to clean up common escape issues and parse again
                     try:
-                        assistant_content = ast.literal_eval(assistant_content)
-                    except Exception as e2:
-                        # Fallback: Try to extract coding_language and suggestions manually
-                        print("Failed to robustly parse assistant response as JSON", e1, e2)
-                        print("Raw response string:", repr(assistant_content))
+                        cleaned = assistant_content.replace("\n", "").replace("\t", "").replace("\\\"", '"').replace("\\'", "'")
+                        assistant_content = json.loads(cleaned)
+                    except Exception as e1:
+                        # Try ast.literal_eval as a last resort
                         try:
-                            # Extract coding_language
-                            lang_match = re.search(r'"coding_language"\s*:\s*"([^"]+)"', assistant_content)
-                            suggestions_match = re.search(r'"suggestions"\s*:\s*\[(.*)\]\s*}', assistant_content, re.DOTALL)
-                            if lang_match and suggestions_match:
-                                coding_language = lang_match.group(1)
-                                # Extract suggestions as a list of strings
-                                suggestions_raw = suggestions_match.group(1)
-                                # Split by ",\n        " but keep inner quotes
-                                suggestions = re.findall(r'"(.*?)"', suggestions_raw, re.DOTALL)
-                                assistant_content = {
-                                    "coding_language": coding_language,
-                                    "suggestions": suggestions
-                                }
-                            else:
-                                raise ValueError("Could not extract coding_language or suggestions")
-                        except Exception as e3:
-                            print("Manual extraction also failed", e3)
-                            raise HTTPException(
-                                status_code=500,
-                                detail="Invalid response format from Lyzr API. Please try again or contact Lyzr support."
-                            )
-        
-        # Validate response structure
-        if not isinstance(assistant_content, dict) or "coding_language" not in assistant_content or "suggestions" not in assistant_content:
-            print(f"Invalid response structure: {assistant_content}")
-            raise HTTPException(
-                status_code=500,
-                detail="Lyzr API returned an invalid response structure. Please try again or contact Lyzr support."
+                            assistant_content = ast.literal_eval(assistant_content)
+                        except Exception as e2:
+                            # Fallback: Try to extract coding_language and suggestions manually
+                            print("Failed to robustly parse assistant response as JSON", e1, e2)
+                            print("Raw response string:", repr(assistant_content))
+                            try:
+                                # Extract coding_language
+                                lang_match = re.search(r'"coding_language"\\s*:\\s*"([^"]+)"', assistant_content)
+                                suggestions_match = re.search(r'"suggestions"\\s*:\\s*\[(.*)\]\\s*}', assistant_content, re.DOTALL)
+                                if lang_match and suggestions_match:
+                                    coding_language = lang_match.group(1)
+                                    # Extract suggestions as a list of strings
+                                    suggestions_raw = suggestions_match.group(1)
+                                    # Split by ",\n        " but keep inner quotes
+                                    suggestions = re.findall(r'"(.*?)"', suggestions_raw, re.DOTALL)
+                                    assistant_content = {
+                                        "coding_language": coding_language,
+                                        "suggestions": suggestions
+                                    }
+                                else:
+                                    raise ValueError("Could not extract coding_language or suggestions")
+                            except Exception as e3:
+                                print("Manual extraction also failed", e3)
+                                last_exception = HTTPException(
+                                    status_code=500,
+                                    detail="Invalid response format from Lyzr API. Please try again or contact Lyzr support."
+                                )
+                                continue
+            
+            # Validate response structure
+            if not isinstance(assistant_content, dict) or "coding_language" not in assistant_content or "suggestions" not in assistant_content:
+                print(f"Invalid response structure: {assistant_content}")
+                last_exception = HTTPException(
+                    status_code=500,
+                    detail="Lyzr API returned an invalid response structure. Please try again or contact Lyzr support."
+                )
+                continue
+
+            coding_language = assistant_content["coding_language"]
+            suggestions = assistant_content["suggestions"]
+
+            # Validate suggestions
+            if not isinstance(suggestions, list) or not (3 <= len(suggestions) <= 5) or not all(isinstance(s, str) for s in suggestions):
+                print(f"Invalid suggestions format or count: {suggestions}")
+                last_exception = HTTPException(
+                    status_code=500,
+                    detail="Lyzr API returned invalid or insufficient suggestions. Please try again or contact Lyzr support."
+                )
+                continue
+
+            return CodeSuggestionResponse(
+                coding_language=coding_language,
+                suggestions=suggestions
             )
-
-        coding_language = assistant_content["coding_language"]
-        suggestions = assistant_content["suggestions"]
-
-        # Validate suggestions
-        if not isinstance(suggestions, list) or not (3 <= len(suggestions) <= 5) or not all(isinstance(s, str) for s in suggestions):
-            print(f"Invalid suggestions format or count: {suggestions}")
-            raise HTTPException(
+        except httpx.HTTPStatusError as e:
+            print(f"Code suggestion API failed on attempt {attempt+1}: {str(e)}")
+            last_exception = HTTPException(
                 status_code=500,
-                detail="Lyzr API returned invalid or insufficient suggestions. Please try again or contact Lyzr support."
+                detail="Failed to generate code suggestions due to an issue with the Lyzr API (possible litellm error). Please try again later or contact Lyzr support."
             )
+        except Exception as e:
+            print(f"Code suggestion API error on attempt {attempt+1}: {str(e)}")
+            last_exception = HTTPException(
+                status_code=500,
+                detail=f"Generate agent API error: {str(e)}. Please try again later or contact Lyzr support."
+            )
+        if attempt < 2:
+            await asyncio.sleep(1)  # Optional: wait before retrying
 
-        return CodeSuggestionResponse(
-            coding_language=coding_language,
-            suggestions=suggestions
-        )
-
-    except httpx.HTTPStatusError as e:
-        print(f"Code suggestion API failed after retries: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to generate code suggestions due to an issue with the Lyzr API (possible litellm error). Please try again later or contact Lyzr support."
-        )
-    except Exception as e:
-        print(f"Code suggestion API error: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail=f"Generate agent API error: {str(e)}. Please try again later or contact Lyzr support."
-        )
+    # If all attempts failed
+    if last_exception:
+        raise last_exception
+    raise HTTPException(
+        status_code=500,
+        detail="Failed to generate code suggestions after 3 attempts. Please try again later or contact Lyzr support."
+    )
 
 
 # Health Check
