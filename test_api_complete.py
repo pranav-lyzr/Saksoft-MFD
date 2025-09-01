@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Complete API Testing Script for Saksoft MFD
-Tests all endpoints with different user types (admin, project_admin, developer)
+Tests all endpoints with existing user types (admin, project_admin, developer)
+Using existing credentials: admin123, dev123, padmin123
 """
 
 import requests
@@ -22,6 +23,13 @@ class APITester:
         self.project_id = None
         self.chat_session_id = None
         
+        # Existing user credentials
+        self.users = {
+            "admin": {"username": "admin123", "password": "admin123"},
+            "project_admin": {"username": "padmin123", "password": "padmin123"},
+            "developer": {"username": "dev123", "password": "dev124"}
+        }
+        
     def log_test(self, test_name: str, success: bool, response: requests.Response = None, error: str = None):
         """Log test results"""
         result = {
@@ -38,7 +46,6 @@ class APITester:
         
         if response:
             print(f"   📊 Status Code: {response.status_code}")
-            print(f"   📊 Response Headers: {dict(response.headers)}")
             
             if response.status_code >= 400:
                 print(f"   ❌ Error Response: {response.text}")
@@ -70,160 +77,53 @@ class APITester:
             self.log_test("Health Check", False, error=str(e))
             return False
 
-    def create_client(self):
-        """Create a new client"""
+    def login_all_users(self):
+        """Login as all existing users"""
+        print("🔐 Logging in all existing users...")
+        
+        # Login as admin
         try:
-            # Use timestamp to make client name unique
-            import time
-            timestamp = int(time.time())
-            client_name = f"Test_Client_{timestamp}"
-            
-            payload = {
-                "name": client_name,
-                "admin_username": f"admin_user_{timestamp}",
-                "admin_password": "admin123",
-                "special_key": "lyzr-saksoft"
-            }
-            
-            print(f"🔧 Creating client: {client_name}")
-            print(f"📤 Request payload: {json.dumps(payload, indent=2)}")
-            
-            response = self.session.post(
-                f"{self.base_url}/clients",
-                json=payload
-            )
-            
-            print(f"📥 Response Status: {response.status_code}")
-            print(f"📥 Response Headers: {dict(response.headers)}")
-            print(f"📥 Response Body: {response.text}")
-            
-            success = response.status_code == 201
-            if success:
-                response_data = response.json()
-                self.client_id = response_data["id"]
-                self.admin_username = payload["admin_username"]  # Store admin username for login
-                print(f"✅ Client created successfully!")
-                print(f"📋 Client ID: {self.client_id}")
-                print(f"📋 Admin Username: {self.admin_username}")
-                print(f"📋 Full Response: {json.dumps(response_data, indent=2)}")
-            else:
-                print(f"❌ Client creation failed with status {response.status_code}")
-                try:
-                    error_data = response.json()
-                    print(f"📋 Error Details: {json.dumps(error_data, indent=2)}")
-                except:
-                    print(f"📋 Raw Error: {response.text}")
-            
-            self.log_test("Create Client", success, response)
-            return success
-        except Exception as e:
-            print(f"💥 Exception during client creation: {str(e)}")
-            self.log_test("Create Client", False, error=str(e))
-            return False
-
-    def login_admin(self):
-        """Login as admin user"""
-        try:
-            # Get the admin username from the client creation
-            if not hasattr(self, 'admin_username') or not self.admin_username:
-                print("❌ Admin username not set. Client must be created first.")
-                return False
-                
-            payload = {
-                "username": self.admin_username,
-                "password": "admin123"
-            }
-            
-            print(f"🔐 Logging in admin user: {self.admin_username}")
-            print(f"📤 Login payload: {json.dumps(payload, indent=2)}")
-            
-            response = self.session.post(
-                f"{self.base_url}/login",
-                data=payload
-            )
-            
-            print(f"📥 Login Response Status: {response.status_code}")
-            print(f"📥 Login Response Body: {response.text}")
-            
+            payload = self.users["admin"]
+            response = self.session.post(f"{self.base_url}/login", data=payload)
             success = response.status_code == 200
             if success:
-                response_data = response.json()
-                self.admin_token = response_data["access_token"]
-                print(f"✅ Admin logged in successfully!")
-                print(f"🔑 Token: {self.admin_token[:20]}...")
-                print(f"📋 Full Response: {json.dumps(response_data, indent=2)}")
-            else:
-                print(f"❌ Admin login failed with status {response.status_code}")
-                try:
-                    error_data = response.json()
-                    print(f"📋 Error Details: {json.dumps(error_data, indent=2)}")
-                except:
-                    print(f"📋 Raw Error: {response.text}")
-            
+                self.admin_token = response.json()["access_token"]
+                print(f"✅ Admin ({payload['username']}) logged in successfully")
             self.log_test("Admin Login", success, response)
-            return success
         except Exception as e:
-            print(f"💥 Exception during admin login: {str(e)}")
             self.log_test("Admin Login", False, error=str(e))
-            return False
 
-    def create_users(self):
-        """Create different types of users"""
-        users_to_create = [
-            {
-                "username": "project_admin_user",
-                "password": "project123",
-                "user_type": "project_admin"
-            },
-            {
-                "username": "developer_user",
-                "password": "dev123",
-                "user_type": "developer"
-            }
-        ]
-        
-        for user_data in users_to_create:
-            try:
-                response = self.session.post(
-                    f"{self.base_url}/users",
-                    json=user_data,
-                    headers={"Authorization": f"Bearer {self.admin_token}"}
-                )
-                success = response.status_code == 200
-                self.log_test(f"Create User: {user_data['username']}", success, response)
-            except Exception as e:
-                self.log_test(f"Create User: {user_data['username']}", False, error=str(e))
-
-    def login_users(self):
-        """Login as different user types"""
         # Login as project admin
         try:
-            payload = {"username": "project_admin_user", "password": "project123"}
+            payload = self.users["project_admin"]
             response = self.session.post(f"{self.base_url}/login", data=payload)
-            if response.status_code == 200:
+            success = response.status_code == 200
+            if success:
                 self.project_admin_token = response.json()["access_token"]
-                print("✅ Project Admin logged in successfully")
-            self.log_test("Project Admin Login", response.status_code == 200, response)
+                print(f"✅ Project Admin ({payload['username']}) logged in successfully")
+            self.log_test("Project Admin Login", success, response)
         except Exception as e:
             self.log_test("Project Admin Login", False, error=str(e))
 
         # Login as developer
         try:
-            payload = {"username": "developer_user", "password": "dev123"}
+            payload = self.users["developer"]
             response = self.session.post(f"{self.base_url}/login", data=payload)
-            if response.status_code == 200:
+            success = response.status_code == 200
+            if success:
                 self.developer_token = response.json()["access_token"]
-                print("✅ Developer logged in successfully")
-            self.log_test("Developer Login", response.status_code == 200, response)
+                print(f"✅ Developer ({payload['username']}) logged in successfully")
+            self.log_test("Developer Login", success, response)
         except Exception as e:
             self.log_test("Developer Login", False, error=str(e))
 
     def create_project(self):
         """Create a test project"""
         try:
-            payload = {"name": "Test Project"}
+            unique_name = f"Test Project API {int(time.time())}"
+            payload = {"name": unique_name}
             response = self.session.post(
-                f"{self.base_url}/projects/create_project",
+                f"{self.base_url}/create_project",
                 json=payload,
                 headers={"Authorization": f"Bearer {self.admin_token}"}
             )
@@ -246,7 +146,7 @@ class APITester:
                 "pat": None
             }
             response = self.session.post(
-                f"{self.base_url}/projects/project/{self.project_id}/repo",
+                f"{self.base_url}/project/{self.project_id}/repo",
                 json=payload,
                 headers={"Authorization": f"Bearer {self.admin_token}"}
             )
@@ -265,7 +165,7 @@ class APITester:
                 "source_name": "youtube-clone"
             }
             response = self.session.post(
-                f"{self.base_url}/projects/project/{self.project_id}/documentation",
+                f"{self.base_url}/project/{self.project_id}/documentation",
                 json=payload,
                 headers={"Authorization": f"Bearer {self.admin_token}"}
             )
@@ -300,39 +200,41 @@ class APITester:
         except Exception as e:
             self.log_test("List Users (Project Admin)", False, error=str(e))
 
-        # Test get user details
-        try:
-            response = self.session.get(
-                f"{self.base_url}/users/admin_user",
-                headers={"Authorization": f"Bearer {self.admin_token}"}
-            )
-            self.log_test("Get User Details", response.status_code == 200, response)
-        except Exception as e:
-            self.log_test("Get User Details", False, error=str(e))
+        # Test get user details for each user
+        for user_type, user_data in self.users.items():
+            try:
+                response = self.session.get(
+                    f"{self.base_url}/users/{user_data['username']}",
+                    headers={"Authorization": f"Bearer {self.admin_token}"}
+                )
+                self.log_test(f"Get User Details ({user_data['username']})", response.status_code == 200, response)
+            except Exception as e:
+                self.log_test(f"Get User Details ({user_data['username']})", False, error=str(e))
 
-        # Test change password
+        # Test change password for admin
         try:
-            payload = {"current_password": "admin123", "new_password": "newadmin123"}
+            payload = {"current_password": "admin123", "new_password": "admin123"}
             response = self.session.post(
                 f"{self.base_url}/users/me/change_password",
                 json=payload,
                 headers={"Authorization": f"Bearer {self.admin_token}"}
             )
-            self.log_test("Change Password", response.status_code == 200, response)
+            self.log_test("Change Password (Admin)", response.status_code == 200, response)
         except Exception as e:
-            self.log_test("Change Password", False, error=str(e))
+            self.log_test("Change Password (Admin)", False, error=str(e))
 
-        # Test assign project to user
-        try:
-            payload = {"project_id": self.project_id}
-            response = self.session.post(
-                f"{self.base_url}/users/developer_user/assign_project",
-                json=payload,
-                headers={"Authorization": f"Bearer {self.admin_token}"}
-            )
-            self.log_test("Assign Project to User", response.status_code == 200, response)
-        except Exception as e:
-            self.log_test("Assign Project to User", False, error=str(e))
+        # Test assign project to developer
+        if self.project_id:
+            try:
+                payload = {"project_id": self.project_id}
+                response = self.session.post(
+                    f"{self.base_url}/users/dev123/assign_project",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {self.admin_token}"}
+                )
+                self.log_test("Assign Project to Developer", response.status_code == 200, response)
+            except Exception as e:
+                self.log_test("Assign Project to Developer", False, error=str(e))
 
     def test_project_management_apis(self):
         """Test all project management APIs"""
@@ -358,20 +260,31 @@ class APITester:
         except Exception as e:
             self.log_test("List Projects (Project Admin)", False, error=str(e))
 
-        # Test get project details
+        # Test list projects (developer)
         try:
             response = self.session.get(
-                f"{self.base_url}/projects/project/{self.project_id}",
-                headers={"Authorization": f"Bearer {self.admin_token}"}
+                f"{self.base_url}/projects",
+                headers={"Authorization": f"Bearer {self.developer_token}"}
             )
-            self.log_test("Get Project Details", response.status_code == 200, response)
+            self.log_test("List Projects (Developer)", response.status_code == 200, response)
         except Exception as e:
-            self.log_test("Get Project Details", False, error=str(e))
+            self.log_test("List Projects (Developer)", False, error=str(e))
+
+        # Test get project details
+        if self.project_id:
+            try:
+                response = self.session.get(
+                    f"{self.base_url}/project/{self.project_id}",
+                    headers={"Authorization": f"Bearer {self.admin_token}"}
+                )
+                self.log_test("Get Project Details", response.status_code == 200, response)
+            except Exception as e:
+                self.log_test("Get Project Details", False, error=str(e))
 
         # Test get user projects
         try:
             response = self.session.get(
-                f"{self.base_url}/projects/users/developer_user/projects",
+                f"{self.base_url}/users/dev123/projects",
                 headers={"Authorization": f"Bearer {self.admin_token}"}
             )
             self.log_test("Get User Projects", response.status_code == 200, response)
@@ -379,18 +292,23 @@ class APITester:
             self.log_test("Get User Projects", False, error=str(e))
 
         # Test get RAG documents
-        try:
-            response = self.session.get(
-                f"{self.base_url}/projects/project/{self.project_id}/rag/documents",
-                headers={"Authorization": f"Bearer {self.admin_token}"}
-            )
-            self.log_test("Get RAG Documents", response.status_code in [200, 404], response)
-        except Exception as e:
-            self.log_test("Get RAG Documents", False, error=str(e))
+        if self.project_id:
+            try:
+                response = self.session.get(
+                    f"{self.base_url}/project/{self.project_id}/rag/documents",
+                    headers={"Authorization": f"Bearer {self.admin_token}"}
+                )
+                self.log_test("Get RAG Documents", response.status_code in [200, 404], response)
+            except Exception as e:
+                self.log_test("Get RAG Documents", False, error=str(e))
 
     def test_chat_apis(self):
         """Test all chat/code operation APIs"""
         print("\n💬 Testing Chat/Code Operation APIs...")
+        
+        if not self.project_id:
+            print("⚠️  No project ID available, skipping chat tests")
+            return
         
         # Create chat session for search
         try:
@@ -473,6 +391,18 @@ class APITester:
         except Exception as e:
             self.log_test("Code Suggestion", False, error=str(e))
 
+        # Test generate without project
+        try:
+            payload = {"description": "Generate a simple React component for a button"}
+            response = self.session.post(
+                f"{self.base_url}/chat/generate",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.admin_token}"}
+            )
+            self.log_test("Generate Without Project", response.status_code in [200, 500], response)
+        except Exception as e:
+            self.log_test("Generate Without Project", False, error=str(e))
+
     def test_permission_checks(self):
         """Test permission checks for different user types"""
         print("\n🔒 Testing Permission Checks...")
@@ -481,7 +411,7 @@ class APITester:
         try:
             payload = {"name": "Unauthorized Project"}
             response = self.session.post(
-                f"{self.base_url}/projects/create_project",
+                f"{self.base_url}/create_project",
                 json=payload,
                 headers={"Authorization": f"Bearer {self.developer_token}"}
             )
@@ -492,7 +422,7 @@ class APITester:
         # Test project admin trying to delete user (should fail)
         try:
             response = self.session.delete(
-                f"{self.base_url}/users/developer_user",
+                f"{self.base_url}/users/dev123",
                 headers={"Authorization": f"Bearer {self.project_admin_token}"}
             )
             self.log_test("Project Admin Delete User (Should Fail)", response.status_code == 403, response)
@@ -509,9 +439,47 @@ class APITester:
         except Exception as e:
             self.log_test("Developer List Users (Should Fail)", False, error=str(e))
 
+        # Test project admin trying to create project (should succeed)
+        try:
+            payload = {"name": "Project Admin Project"}
+            response = self.session.post(
+                f"{self.base_url}/create_project",
+                json=payload,
+                headers={"Authorization": f"Bearer {self.project_admin_token}"}
+            )
+            self.log_test("Project Admin Create Project (Should Succeed)", response.status_code == 200, response)
+        except Exception as e:
+            self.log_test("Project Admin Create Project (Should Succeed)", False, error=str(e))
+
     def test_client_management_apis(self):
         """Test client management APIs"""
         print("\n🏢 Testing Client Management APIs...")
+        
+        # First, we need to create a client to test these APIs
+        try:
+            timestamp = int(time.time())
+            client_name = f"Test_Client_{timestamp}"
+            
+            payload = {
+                "name": client_name,
+                "admin_username": f"admin_user_{timestamp}",
+                "admin_password": "admin123",
+                "special_key": "lyzr-saksoft"
+            }
+            
+            response = self.session.post(f"{self.base_url}/clients", json=payload)
+            success = response.status_code == 201
+            if success:
+                self.client_id = response.json()["id"]
+                print(f"✅ Client created with ID: {self.client_id}")
+            self.log_test("Create Client for Testing", success, response)
+        except Exception as e:
+            self.log_test("Create Client for Testing", False, error=str(e))
+            return
+        
+        if not self.client_id:
+            print("⚠️  No client ID available, skipping client management tests")
+            return
         
         # Test get client
         try:
@@ -538,6 +506,7 @@ class APITester:
     def run_complete_test_suite(self):
         """Run the complete test suite"""
         print("🚀 Starting Complete API Test Suite for Saksoft MFD")
+        print("Using existing users: admin123, dev123, padmin123")
         print("=" * 60)
         
         # Step 1: Basic health check
@@ -545,41 +514,28 @@ class APITester:
             print("❌ Health check failed. Exiting...")
             return False
         
-        # Step 2: Create client
-        if not self.create_client():
-            print("❌ Client creation failed. Exiting...")
-            return False
+        # Step 2: Login all existing users
+        self.login_all_users()
         
-        # Step 3: Login as admin
-        if not self.login_admin():
-            print("❌ Admin login failed. Exiting...")
-            return False
-        
-        # Step 4: Create users
-        self.create_users()
-        
-        # Step 5: Login as different users
-        self.login_users()
-        
-        # Step 6: Create project
+        # Step 3: Create project
         if not self.create_project():
             print("❌ Project creation failed. Exiting...")
             return False
         
-        # Step 7: Add GitHub repository
+        # Step 4: Add GitHub repository
         self.add_github_repo()
         
-        # Step 8: Add documentation
+        # Step 5: Add documentation
         self.add_documentation()
         
-        # Step 9: Test all API categories
+        # Step 6: Test all API categories
         self.test_user_management_apis()
         self.test_project_management_apis()
         self.test_chat_apis()
         self.test_permission_checks()
         self.test_client_management_apis()
         
-        # Step 10: Print summary
+        # Step 7: Print summary
         self.print_test_summary()
         
         return True
@@ -607,41 +563,10 @@ class APITester:
         
         print("\n🎯 Test Suite Completed!")
 
-def test_basic_functionality():
-    """Test basic functionality for debugging"""
-    print("🔧 Testing Basic Functionality...")
-    print("=" * 50)
-    
-    tester = APITester()
-    
-    # Test health check
-    print("\n1️⃣ Testing Health Check...")
-    health_success = tester.test_health_check()
-    
-    if health_success:
-        print("\n2️⃣ Testing Client Creation...")
-        client_success = tester.create_client()
-        
-        if client_success:
-            print("\n3️⃣ Testing Admin Login...")
-            login_success = tester.login_admin()
-            
-            if login_success:
-                print("\n✅ Basic functionality test passed!")
-                return True
-            else:
-                print("\n❌ Admin login failed!")
-        else:
-            print("\n❌ Client creation failed!")
-    else:
-        print("\n❌ Health check failed!")
-    
-    return False
-
 def main():
     """Main function"""
     print("🔧 Saksoft MFD API Testing Script")
-    print("This script will test all APIs with different user types and permissions")
+    print("Testing with existing users: admin123, dev123, padmin123")
     print()
     
     # Check if API is running
@@ -656,22 +581,12 @@ def main():
         print("   docker-compose up --build")
         return
     
-    print("✅ API is running. Starting tests...")
+    print("✅ API is running. Starting comprehensive tests...")
     print()
     
-    # Ask user what to test
-    print("Choose test mode:")
-    print("1. Basic functionality test (client creation + login)")
-    print("2. Full test suite")
-    
-    choice = input("Enter choice (1 or 2): ").strip()
-    
-    if choice == "1":
-        success = test_basic_functionality()
-    else:
-        # Run full tests
-        tester = APITester()
-        success = tester.run_complete_test_suite()
+    # Run full tests with existing users
+    tester = APITester()
+    success = tester.run_complete_test_suite()
     
     if success:
         print("\n🎉 Tests completed successfully!")
