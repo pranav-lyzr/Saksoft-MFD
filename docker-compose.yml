@@ -11,8 +11,11 @@ services:
       - mongo
     environment:
       - MONGO_URI=mongodb://root:example@mongo:27017/mydatabase?authSource=admin  # MongoDB connection string
+      - SECRET_KEY=lyzr-saksoft  # JWT secret key
+      - PYTHONPATH=/app  # Ensure Python can find the app module
     stdin_open: true  # Keep the container's standard input open
     tty: true  # Allocate a pseudo-TTY
+    restart: unless-stopped  # Restart policy for production
 
   mongo:
     image: mongo:latest  # Use the latest stable MongoDB version

@@ -16,5 +16,5 @@ COPY . .
 # Expose FastAPI's default port
 EXPOSE 8000
 
-# Start FastAPI application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+# Start FastAPI application using the new modular structure
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
