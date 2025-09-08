@@ -95,7 +95,7 @@ async def read_user(user_id: str, current_user: User = Depends(get_current_user)
     user_model = User(
         id=str(user["_id"]),
         username=user["username"],
-        user_type=user["user_type"],
+        user_type=UserType(user["user_type"]),
         is_active=user["is_active"],
         projects=[str(pid) for pid in user.get("projects", [])],
         client_id=user["client_id"]
@@ -122,7 +122,7 @@ async def read_user(user_id: str, current_user: User = Depends(get_current_user)
             "updated_at": session["updated_at"]
         } for session in sessions
     ]
-    session_ids = [ObjectId(session["id"]) for session in chat_sessions]
+    session_ids = [ObjectId(session["_id"]) for session in sessions]
     messages = await chat_messages_collection.find({"session_id": {"$in": session_ids}}).to_list(None)
     chat_messages = [
         {

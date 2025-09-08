@@ -33,8 +33,8 @@ async def create_chat_session(
         "project_id": ObjectId(project_id),
         "type": session_type,
         "agent_session_id": str(uuid4()),
-        "created_at": datetime.now(),
-        "updated_at": datetime.now()
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
     }
     result = await chat_sessions_collection.insert_one(session_data)
     return {"session_id": str(result.inserted_id), "agent_session_id": session_data["agent_session_id"]}
@@ -81,7 +81,7 @@ async def search_in_session(session_id: str, query: AgentQuery, current_user = D
         "session_id": obj_id,
         "role": "user",
         "content": query.message,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.utcnow(),
         "type": "search"
     }
     await chat_messages_collection.insert_one(user_message)
@@ -90,12 +90,12 @@ async def search_in_session(session_id: str, query: AgentQuery, current_user = D
         "session_id": obj_id,
         "role": "assistant",
         "content": assistant_content,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.utcnow(),
         "type": "search"
     }
     assistant_message_result = await chat_messages_collection.insert_one(assistant_message)
 
-    await chat_sessions_collection.update_one({"_id": obj_id}, {"$set": {"updated_at": datetime.now()}})
+    await chat_sessions_collection.update_one({"_id": obj_id}, {"$set": {"updated_at": datetime.utcnow()}})
     return {
         "id": str(assistant_message_result.inserted_id),
         "session_id": str(obj_id),
@@ -185,7 +185,7 @@ async def generate_technical_documentation(project_id: str, current_user = Depen
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
-    if current_user.user_type.value != "admin" and str(obj_id) not in current_user.projects:
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     # Use project's generate_agent_id if available, otherwise use default
@@ -198,8 +198,8 @@ async def generate_technical_documentation(project_id: str, current_user = Depen
         "project_id": obj_id,
         "type": "technical",
         "agent_session_id": str(uuid4()),
-        "created_at": datetime.now(),
-        "updated_at": datetime.now()
+        "created_at": datetime.utcnow(),
+        "updated_at": datetime.utcnow()
     }
     session_result = await chat_sessions_collection.insert_one(session_data)
     session_id = session_result.inserted_id
@@ -221,7 +221,7 @@ async def generate_technical_documentation(project_id: str, current_user = Depen
         "session_id": session_id,
         "role": "user",
         "content": prompt,
-        "timestamp": datetime.now(),
+        "timestamp": datetime.utcnow(),
         "type": "technical"
     }
     await chat_messages_collection.insert_one(user_message)
@@ -273,7 +273,7 @@ async def generate_impact_analysis(project_id: str, change_request: ChangeReques
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
-    if current_user.user_type.value != "admin" and str(obj_id) not in current_user.projects:
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     # Use project's generate_agent_id if available, otherwise use default

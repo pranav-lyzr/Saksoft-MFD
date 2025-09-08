@@ -18,7 +18,7 @@ router = APIRouter()
 @router.get("/projects", response_model=List[ProjectResponse], tags=["Project Management"])
 async def list_projects(current_user = Depends(get_current_admin_or_project_admin_user)):
     """List projects based on user permissions"""
-    if current_user.user_type.value == "admin":
+    if current_user.user_type == UserType.admin:
         projects = await projects_collection.find({"client_id": current_user.client_id}).to_list(None)
     else:
         project_ids = [ObjectId(pid) for pid in current_user.projects]
@@ -51,9 +51,9 @@ async def get_user_projects(user_id: str, current_user = Depends(get_current_use
     except:
         raise HTTPException(status_code=400, detail="Invalid user ID format")
     
-    if current_user.user_type.value == "admin":
+    if current_user.user_type == UserType.admin:
         pass
-    elif current_user.user_type.value == "project_admin":
+    elif current_user.user_type == UserType.project_admin:
         if not set(current_user.projects).intersection(user.get("projects", [])) and user_id != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to view this user's projects")
     else:
@@ -91,9 +91,9 @@ async def get_user_projects_details(user_id: str, current_user = Depends(get_cur
         raise HTTPException(status_code=400, detail="Invalid user ID format")
 
     # Authorization checks
-    if current_user.user_type.value == "admin":
+    if current_user.user_type == UserType.admin:
         pass
-    elif current_user.user_type.value == "project_admin":
+    elif current_user.user_type == UserType.project_admin:
         if not set(current_user.projects).intersection(user.get("projects", [])) and user_id != current_user.id:
             raise HTTPException(status_code=403, detail="Not authorized to view this user's projects")
     else:
@@ -154,7 +154,7 @@ async def create_project(project: ProjectCreate, current_user = Depends(get_curr
         "repo_analyses": [],
         "client_id": current_user.client_id,
         "created_by": current_user.id,
-        "created_at": datetime.now()
+        "created_at": datetime.utcnow()
     }
     result = await projects_collection.insert_one(new_project)
     project_id = result.inserted_id
@@ -173,7 +173,7 @@ async def create_project(project: ProjectCreate, current_user = Depends(get_curr
         )
     
     # Assign to project_admin if they created it
-    if current_user.user_type.value == "project_admin":
+    if current_user.user_type == UserType.project_admin:
         await users_collection.update_one(
             {"_id": ObjectId(current_user.id)},
             {"$addToSet": {"projects": project_id}}
@@ -298,7 +298,7 @@ async def add_documentation(project_id: str, input: DocumentationInput, current_
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
-    if current_user.user_type.value != "admin" and str(obj_id) not in current_user.projects:
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     if not input.text.strip():
@@ -313,7 +313,7 @@ async def add_documentation(project_id: str, input: DocumentationInput, current_
     # Add new documentation
     await projects_collection.update_one(
         {"_id": obj_id},
-        {"$push": {"documentation": {"text": input.text, "source_name": input.source_name, "submitted_at": datetime.now()}}}
+        {"$push": {"documentation": {"text": input.text, "source_name": input.source_name, "submitted_at": datetime.utcnow()}}}
     )
 
     # Process documentation for RAG
@@ -422,7 +422,7 @@ async def get_rag_documents(project_id: str, current_user = Depends(get_current_
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
-    if current_user.user_type.value != "admin" and str(obj_id) not in current_user.projects:
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     if "rag_id" not in project:
@@ -451,7 +451,7 @@ async def delete_repository_rag_documents(project_id: str, delete_request: Delet
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
-    if current_user.user_type.value != "admin" and str(obj_id) not in current_user.projects:
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
 
     if "rag_id" not in project:
@@ -519,7 +519,7 @@ async def get_project(project_id: str, current_user = Depends(get_current_user))
     if not project:
         raise HTTPException(status_code=404, detail="Project not found or not in your client")
     
-    if current_user.user_type.value != "admin" and str(obj_id) not in current_user.projects:
+    if current_user.user_type != UserType.admin and str(obj_id) not in current_user.projects:
         raise HTTPException(status_code=403, detail="Not authorized to access this project")
         
     return ProjectResponse(

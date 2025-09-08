@@ -26,7 +26,7 @@ async def create_client(client_data: ClientCreate):
     admin_data = {
         "username": client_data.admin_username,
         "hashed_password": hashed_password,
-        "user_type": "admin",
+        "user_type": UserType.admin,
         "is_active": True,
         "projects": [],
         "client_id": None
@@ -38,7 +38,7 @@ async def create_client(client_data: ClientCreate):
         "name": client_data.name,
         "admin_id": admin_id,
         "secret_key": client_data.special_key,
-        "created_at": datetime.now()
+        "created_at": datetime.utcnow()
     }
     client_result = await clients_collection.insert_one(new_client)
     client_id = str(client_result.inserted_id)
