@@ -16,3 +16,4 @@ sqlparse==0.4.4
 tqdm==4.66.1
 matplotlib==3.8.2
 aiofiles==23.2.1
+json-repair
