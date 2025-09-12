@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import List
 from app.models.chat import ChatSession, Message, AgentQuery
 from app.models.documentation import DocumentationResponse, ImpactAnalysisResponse, ChangeRequest, CodeSuggestionRequest, CodeSuggestionResponse
+from app.models.user import UserType
 from app.dependencies.auth import get_current_user, check_project_access
 from app.database import chat_sessions_collection, chat_messages_collection, projects_collection
 from app.services.agent_service import AgentService
